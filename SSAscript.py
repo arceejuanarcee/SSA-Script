@@ -56,7 +56,7 @@ def fetch_data(url, filename):
 
 def send_teams_notification(norad_id, debris_type, lat, lon, next_report, decay_epoch, high_interest):
     """Sends a Microsoft Teams notification using an Adaptive Card for structured reporting."""
-    status = "High Interest" if high_interest else "Non-High Interest"
+    status = "High Interest Object" if high_interest else "Low Interest Object"
     payload = {
         "type": "message",
         "attachments": [
@@ -72,7 +72,8 @@ def send_teams_notification(norad_id, debris_type, lat, lon, next_report, decay_
                         {"type": "TextBlock", "text": f"**Longitude:** {lon}", "wrap": True},
                         {"type": "TextBlock", "text": f"**Next Report:** {next_report}", "wrap": True},
                         {"type": "TextBlock", "text": f"**Decay Date:** {decay_epoch}", "wrap": True},
-                        {"type": "TextBlock", "text": f"Status: {status}", "wrap": True}
+                        {"type": "TextBlock", "text": f"Status: {status}", "wrap": True},
+                        {"type": "TextBlock", "text": "Sourced from space-track.org", "wrap": True, "size": "Small", "color": "Accent"}
                     ],
                     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                     "version": "1.2"
@@ -105,7 +106,7 @@ def check_for_new_debris():
                     send_teams_notification(norad_id, debris_type, lat, lon, next_report, decay_epoch, high_interest=True)
                     new_high_interest.append(int(norad_id))
 
-    # Process non-high-interest debris
+    # Process low-interest debris (previously "non-high interest")
     if os.path.exists("OrbitalDebrisN.csv"):
         with open("OrbitalDebrisN.csv", "r") as file:
             reader = csv.reader(file)
