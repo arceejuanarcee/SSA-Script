@@ -4,9 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Philippine Space Situational Awareness</title>
+    <!-- Add Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/main-BvDio_8i.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-F47Nz-at.css">
 </head>
 <body>
 
@@ -15,15 +17,17 @@
         <h1>Space Situational Awareness - Debris Monitoring</h1>
     </header>
 
+    <!-- Fixed Toggle Bar (Separated from Map) -->
+    <div class="toggle-controls">
+        <label>
+            <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
+        </label>
+        <label>
+            <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
+        </label>
+    </div>
+
     <div class="map-container">
-        <div class="toggle-controls">
-            <label>
-                <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
-            </label>
-            <label>
-                <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
-            </label>
-        </div>
         <div id="map"></div>
     </div>
 
