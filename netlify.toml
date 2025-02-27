@@ -1,0 +1,30 @@
+# netlify.toml
+# This file should be placed in the root of your project
+
+[build]
+  publish = "/"  # Publish from the root directory
+
+[[headers]]
+  # Define which paths should get custom headers
+  for = "/*"
+    [headers.values]
+    # CORS settings to allow CSV loading
+    Access-Control-Allow-Origin = "*"
+
+# Redirect rules to handle file paths
+[[redirects]]
+  from = "/OrbitalDebrisY.csv"
+  to = "/OrbitalDebrisY.csv"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/OrbitalDebrisN.csv"
+  to = "/OrbitalDebrisN.csv"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

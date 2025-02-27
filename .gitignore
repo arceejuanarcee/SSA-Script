@@ -1,3 +1,10 @@
 .env
 last_known_debris.json
 test.py
+.DS_Store
+.cache
+.vscode
+web_modules
+node_modules
+dist
+.vite
