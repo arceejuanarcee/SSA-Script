@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
+import { viteStaticCopy } from 'vite-plugin-static-copy'; // FIXED IMPORT
 
 export default defineConfig({
   root: 'src',
@@ -15,4 +16,14 @@ export default defineConfig({
       },
     },
   },
+  plugins: [
+    viteStaticCopy({
+      targets: [
+        {
+          src: 'src/map.js',  // Source file
+          dest: ''  // Copies it directly to dist/
+        }
+      ]
+    })
+  ]
 });

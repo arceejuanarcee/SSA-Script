@@ -3,15 +3,14 @@
   "version": "1.0.0",
   "main": "babel.config.js",
   "scripts": {
-  "dev": "vite",
-  "build": "vite build",
-  "preview": "vite preview",
-  "lint": "eslint *.js src/**/*.js",
-  "format": "prettier --ignore-path ./.gitignore --write \"./**/*.{html,json,js,ts,css}\"",
-  "test": "jest",
-  "start": "vite"
-}
-,
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint *.js src/**/*.js",
+    "format": "prettier --ignore-path ./.gitignore --write \"./**/*.{html,json,js,ts,css}\"",
+    "test": "jest",
+    "start": "vite"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -23,6 +22,7 @@
     "eslint": "^9.19.0",
     "eslint-plugin-react": "^7.37.4",
     "globals": "^15.14.0",
-    "vite": "^6.0.11"
+    "vite": "^6.0.11",
+    "vite-plugin-static-copy": "^2.2.0"
   }
 }
