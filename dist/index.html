@@ -3,15 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>D2 ARU Operations Summary Report</title>
+    <title>Space Situational Awareness - Debris Monitoring</title>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/main-D2GCeg-7.css">
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/main-DYAfi4af.css">
 </head>
 <body>
 
     <header>
         <img src="/assets/PhilSA_v4-01-BhQ3hMpb.png" alt="PhilSA Logo" class="logo">
-        <h1>2024 D2 ARU Operations Summary Report</h1>
+        <h1>Space Situational Awareness - Debris Monitoring</h1>
     </header>
 
     <div class="container">
@@ -41,8 +43,22 @@
             <h2>Country Frequency Heatmap</h2>
             <div id="heatmapChart"></div>
         </section>
+
+        <section id="map-container">
+            <h2>Debris Monitoring Map</h2>
+            <div class="toggle-controls">
+                <label>
+                    <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
+                </label>
+                <label>
+                    <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
+                </label>
+            </div>
+            <div id="map"></div>
+        </section>
     </div>
 
     <script src="script.js"></script>
+    <script src="map.js"></script>
 </body>
 </html>
