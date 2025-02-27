@@ -3,9 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Space Situational Awareness - Debris Monitoring</title>
+    <title>Philippine Space Situational Awareness</title>
     <link rel="stylesheet" href="styles.css">
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <!-- Add Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
 </head>
@@ -16,49 +17,20 @@
         <h1>Space Situational Awareness - Debris Monitoring</h1>
     </header>
 
-    <div class="container">
-        <section id="filters">
-            <label for="year">Select Year:</label>
-            <select id="year"></select>
-
-            <label for="month">Select Month:</label>
-            <select id="month"></select>
-
-            <button onclick="fetchData()">Generate Report</button>
-        </section>
-
-        <section id="summary">
-            <h2>QSL Counter and Country Analysis</h2>
-            <p>Total Requests: <span id="totalRequests">Loading...</span></p>
-            <h3>Top 5 Countries</h3>
-            <ul id="topCountries"></ul>
-        </section>
-
-        <section id="graphs">
-            <h2>QSL Request Trends</h2>
-            <div id="barChart"></div>
-        </section>
-
-        <section id="heatmap">
-            <h2>Country Frequency Heatmap</h2>
-            <div id="heatmapChart"></div>
-        </section>
-
-        <section id="map-container">
-            <h2>Debris Monitoring Map</h2>
-            <div class="toggle-controls">
-                <label>
-                    <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
-                </label>
-                <label>
-                    <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
-                </label>
-            </div>
-            <div id="map"></div>
-        </section>
+    <!-- Fixed Toggle Bar (Separated from Map) -->
+    <div class="toggle-controls">
+        <label>
+            <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
+        </label>
+        <label>
+            <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
+        </label>
     </div>
 
-    <script src="script.js"></script>
+    <div class="map-container">
+        <div id="map"></div>
+    </div>
+
     <script src="map.js"></script>
 </body>
 </html>
