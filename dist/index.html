@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>D2 ARU Operations Summary Report</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/main-D2GCeg-7.css">
+</head>
+<body>
+
+    <header>
+        <img src="/assets/PhilSA_v4-01-BhQ3hMpb.png" alt="PhilSA Logo" class="logo">
+        <h1>2024 D2 ARU Operations Summary Report</h1>
+    </header>
+
+    <div class="container">
+        <section id="filters">
+            <label for="year">Select Year:</label>
+            <select id="year"></select>
+
+            <label for="month">Select Month:</label>
+            <select id="month"></select>
+
+            <button onclick="fetchData()">Generate Report</button>
+        </section>
+
+        <section id="summary">
+            <h2>QSL Counter and Country Analysis</h2>
+            <p>Total Requests: <span id="totalRequests">Loading...</span></p>
+            <h3>Top 5 Countries</h3>
+            <ul id="topCountries"></ul>
+        </section>
+
+        <section id="graphs">
+            <h2>QSL Request Trends</h2>
+            <div id="barChart"></div>
+        </section>
+
+        <section id="heatmap">
+            <h2>Country Frequency Heatmap</h2>
+            <div id="heatmapChart"></div>
+        </section>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
