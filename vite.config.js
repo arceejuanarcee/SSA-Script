@@ -14,5 +14,7 @@ export default defineConfig({
         main: resolve(__dirname, "src/index.html"),
       },
     },
-  }
+  },
+  // Ensure public files are copied to dist
+  publicDir: "../public"
 });
