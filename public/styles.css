@@ -1,0 +1,85 @@
+body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    background-color: #f4f4f4;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    background-color: #00274D;
+    color: white;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0px 4px 8px rgba(0, 0, 0, 0.2);
+    position: relative;
+}
+
+.logo {
+    width: 120px;
+    margin-bottom: 10px;
+}
+
+/* Toggle buttons fixed */
+.toggle-controls {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    margin: 15px auto;
+    font-size: 14px;
+    background: white;
+    padding: 10px;
+    border-radius: 5px;
+    box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
+    width: fit-content;
+    z-index: 1000;
+}
+
+/* Make the map fit the full width */
+.map-container {
+    flex: 1;
+    width: 100%;
+    margin: 0 auto 10px;
+    background: white;
+    box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1);
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Fullscreen map */
+#map {
+    width: 100%;
+    height: 100%;
+    border-radius: 5px;
+}
+
+/* Fix Leaflet tile rendering issue */
+.leaflet-container {
+    width: 100% !important;
+    height: 100% !important;
+    border-radius: 5px;
+}
+
+/* Style popup content */
+.marker-popup {
+    max-height: 250px;
+    overflow-y: auto;
+    padding: 5px;
+}
+
+/* Make custom markers more visible */
+.custom-marker {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.custom-marker div {
+    border: 2px solid white;
+    box-shadow: 0 0 4px rgba(0,0,0,0.4);
+}

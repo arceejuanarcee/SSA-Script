@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Philippine Space Situational Awareness</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- Add Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+</head>
+<body>
+
+    <header>
+        <img src="graphics/PhilSA_v4-01.png" alt="PhilSA Logo" class="logo">
+        <h1>Space Situational Awareness - Debris Monitoring</h1>
+    </header>
+
+    <!-- Fixed Toggle Bar (Separated from Map) -->
+    <div class="toggle-controls">
+        <label>
+            <input type="checkbox" id="toggleHighInterest" checked> High - Interest Objects
+        </label>
+        <label>
+            <input type="checkbox" id="toggleLowInterest" checked> Low - Interest Objects
+        </label>
+    </div>
+
+    <div class="map-container">
+        <div id="map"></div>
+    </div>
+
+    <script type="module" src="/map.js"></script>
+    <script type="module" src="/script.js"></script>
+</body>
+</html>
