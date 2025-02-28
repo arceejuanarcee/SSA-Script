@@ -11,11 +11,11 @@ function loadCSV(file, callback) {
 }
 
 // Load High-Interest Objects
-loadCSV("/OrbitalDebrisY.csv", function (data) {
+loadCSV("OrbitalDebrisY.csv", function (data) {
     addMarkers(data, highInterestLayer, "red");
 });
 
 // Load Low-Interest Objects
-loadCSV("/OrbitalDebrisN.csv", function (data) {
+loadCSV("OrbitalDebrisN.csv", function (data) {
     addMarkers(data, lowInterestLayer, "blue");
 });
