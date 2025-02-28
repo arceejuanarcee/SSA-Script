@@ -15,15 +15,4 @@ export default defineConfig({
       },
     },
   },
-  plugins: [
-    {
-      name: "copy-csv-to-root",
-      apply: "build",
-      closeBundle() {
-        const fs = require("fs");
-        fs.copyFileSync("OrbitalDebrisY.csv", "dist/OrbitalDebrisY.csv");
-        fs.copyFileSync("OrbitalDebrisN.csv", "dist/OrbitalDebrisN.csv");
-      },
-    },
-  ],
 });
