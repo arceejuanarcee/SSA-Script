@@ -7,15 +7,12 @@ document.addEventListener("DOMContentLoaded", function () {
       scrollWheelZoom: true,
     });
   
-    // Use Google Satellite tiles
-    // NOTE: Using Google’s tiles via Leaflet typically requires
-    // a proper license or the official Google Maps JS API.
-    L.tileLayer("https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", {
-      subdomains: ["mt0", "mt1", "mt2", "mt3"],
-      attribution: "&copy; Google Maps",
+    // Use OpenStreetMap tiles
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap contributors"
     }).addTo(map);
   
-    // Helper function to fix map size
+    // Helper function to fix the map size if the container resizes
     function fixMapSize() {
       setTimeout(() => {
         map.invalidateSize();
@@ -30,13 +27,13 @@ document.addEventListener("DOMContentLoaded", function () {
       [21.5, 127.0],
       [4.5, 127.0],
       [4.5, 117.0],
-      [21.5, 117.0],
+      [21.5, 117.0]
     ];
   
     L.polygon(phTerritorialZone, {
       color: "red",
       fillColor: "transparent",
-      weight: 2,
+      weight: 2
     })
       .addTo(map)
       .bindPopup("Philippine Territorial Zone");
@@ -45,7 +42,7 @@ document.addEventListener("DOMContentLoaded", function () {
     const highInterestLayer = L.layerGroup().addTo(map);
     const lowInterestLayer = L.layerGroup().addTo(map);
   
-    // Function to add markers
+    // Function to add markers to the specified layer
     function addMarkers(data, layer, color) {
       data.forEach((entry) => {
         const lat = parseFloat(entry.Latitude);
@@ -55,8 +52,8 @@ document.addEventListener("DOMContentLoaded", function () {
           const marker = L.marker([lat, lng], {
             icon: L.divIcon({
               className: "custom-marker",
-              html: `<div style="background-color: ${color}; width: 14px; height: 14px; border-radius: 50%;"></div>`,
-            }),
+              html: `<div style="background-color: ${color}; width: 14px; height: 14px; border-radius: 50%;"></div>`
+            })
           });
   
           // Create a popup with all available data
@@ -98,7 +95,7 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     }
   
-    // CSV loader with Papa Parse
+    // CSV loader using Papa Parse
     function loadCSV(file, callback) {
       console.log(`Loading CSV file: ${file}`);
       Papa.parse(file, {
@@ -106,17 +103,16 @@ document.addEventListener("DOMContentLoaded", function () {
         header: true,
         skipEmptyLines: true,
         complete: function (results) {
-          console.log(`${file} loaded`, results.data.length + " records found");
+          console.log(`${file} loaded, ${results.data.length} records found`);
           callback(results.data);
         },
         error: function (error) {
           console.error(`Error loading CSV file ${file}:`, error);
-        },
+        }
       });
     }
   
     // Load High-Interest Objects
-    // If placed in Netlify’s public folder, reference it as "/OrbitalDebrisY.csv"
     loadCSV("/OrbitalDebrisY.csv", function (data) {
       console.log("Adding high interest markers", data.length);
       addMarkers(data, highInterestLayer, "red");
