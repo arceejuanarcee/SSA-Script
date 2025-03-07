@@ -23,11 +23,14 @@ document.addEventListener("DOMContentLoaded", function () {
   
     // Define polygon for Philippine territorial zone
     const phTerritorialZone = [
-      [21.5, 117.0],
-      [21.5, 127.0],
-      [4.5, 127.0],
-      [4.5, 117.0],
-      [21.5, 117.0]
+        [20,118],
+        [20,127],
+        [4.75,127],
+        [4.75,119.583],
+        [7.667,119.583],
+        [7.667,116],
+        [10,118],
+        [20,118]
     ];
   
     L.polygon(phTerritorialZone, {
