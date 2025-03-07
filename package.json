@@ -4,7 +4,7 @@
   "main": "babel.config.js",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build":"vite build && copyfiles -u 1 \"public/**/*\" dist", 
     "preview": "vite preview",
     "lint": "eslint *.js src/**/*.js",
     "format": "prettier --ignore-path ./.gitignore --write \"./**/*.{html,json,js,ts,css}\"",

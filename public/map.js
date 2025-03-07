@@ -23,14 +23,14 @@ document.addEventListener("DOMContentLoaded", function () {
   
     // Define polygon for Philippine territorial zone
     const phTerritorialZone = [
-        [20,118],
-        [20,127],
-        [4.75,127],
-        [4.75,119.583],
-        [7.667,119.583],
-        [7.667,116],
-        [10,118],
-        [20,118]
+      [20, 118],
+      [20, 127],
+      [4.75, 127],
+      [4.75, 119.583],
+      [7.667, 119.583],
+      [7.667, 116],
+      [10, 118],
+      [20, 118]
     ];
   
     L.polygon(phTerritorialZone, {
@@ -41,7 +41,7 @@ document.addEventListener("DOMContentLoaded", function () {
       .addTo(map)
       .bindPopup("Philippine Territorial Zone");
   
-    // Create layer groups for markers
+    // Create layer groups for markers (currently not used)
     const highInterestLayer = L.layerGroup().addTo(map);
     const lowInterestLayer = L.layerGroup().addTo(map);
   
@@ -98,6 +98,8 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     }
   
+    // --- CSV loading code is commented out for now ---
+    /*
     // CSV loader using Papa Parse
     function loadCSV(file, callback) {
       console.log(`Loading CSV file: ${file}`);
@@ -126,5 +128,6 @@ document.addEventListener("DOMContentLoaded", function () {
       console.log("Adding low interest markers", data.length);
       addMarkers(data, lowInterestLayer, "blue");
     });
+    */
   });
   
