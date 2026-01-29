@@ -1,0 +1,22 @@
+{
+  "kp_latest": [
+    "2026-01-29 09:00:00.000",
+    3.67
+  ],
+  "f107_latest": [
+    "2025-12-19T17:00:00",
+    118.0
+  ],
+  "predicted_a_index": [
+    "2026-01-29",
+    8.0
+  ],
+  "msis_drag_proxy": null,
+  "expected_time_utc": "2026-01-30 09:40:30Z",
+  "expected_time_ph": "2026-01-30 17:40:30 (PH)",
+  "sources": {
+    "kp": "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
+    "f107": "https://services.swpc.noaa.gov/json/f107_cm_flux.json",
+    "pred_a": "https://services.swpc.noaa.gov/json/predicted_fredericksburg_a_index.json"
+  }
+}
