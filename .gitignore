@@ -8,3 +8,4 @@ web_modules
 node_modules
 dist
 .vite
+reentry_out
