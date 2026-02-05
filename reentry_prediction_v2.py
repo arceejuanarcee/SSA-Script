@@ -1,41 +1,41 @@
 #!/usr/bin/env python3
 """
-Reentry Prediction & Assessment Tool (TIP + Sequential TLE + Monte Carlo Window + KML/JSON Outputs)
+Reentry Prediction & Assessment Tool (TIP + Latest TLE) — EU SST-aligned outputs
+Outputs aligned to EU SST "Product Viewer":
+  - Re-entry Point (centre of window)  -> KML Point
+  - Re-entry Ground Track              -> KML LineString
+  - Re-entry Swath (±X km)             -> KML Polygon (buffer around ground track)
 
-Design goal:
-- Restructure the existing GUI script into a Digantara-like operational pipeline:
-  1) Pre-processing: TLE filtering + adaptive drag/BC proxy from sequential TLEs
-  2) Core simulation: SGP4 ground track + simple altitude-decay proxy to bracket reentry around TIP window
-  3) Uncertainty modelling: Monte Carlo confidence window (percentiles) for time and impact subpoint
-  4) Optional breakup proxy: fragment footprint KML (explicitly heuristic)
-  5) Outputs: JSON summary + KMLs + PNG (map)
+Key alignment choices (to match EU SST visuals/logic):
+1) TIP "latest MSG_EPOCH batch only" is the operational truth.
+2) Reentry epoch = centre (midpoint) of the TIP decay window.
+3) Ground track is computed around the reentry epoch (configurable ± minutes).
+4) Swath is a geodesic-ish buffer (left/right offsets) around that ground track, default ±100 km.
 
-IMPORTANT:
-- TIP window is still the primary operator-facing truth.
-- The Monte Carlo layer here is an uncertainty model around TIP + drag proxy; it is NOT a full high-fidelity aerothermal reentry.
-- This script focuses on "operational style + outputs" similar to Digantara's framework, not proprietary physics.
+Notes:
+- This is NOT a high-fidelity aerothermal model; it's a clean ops-style product generator.
+- The swath buffering uses spherical Earth great-circle destination calculations (good for ops maps).
 
 Requirements:
   pip install requests skyfield matplotlib python-dotenv cartopy numpy simplekml
 
-Optional:
-  pip install pymsis   (if you want your earlier MSIS proxy back; kept optional here)
-
-Env vars (or GUI input):
+Env vars (via .env or system env):
   SPACE_TRACK_USERNAME
   SPACE_TRACK_PASSWORD
-  NORAD_CAT_ID
+Optional:
+  NORAD_CAT_ID=66877
   OUT_DIR=./reentry_out
+  TIP_URL=... (override full URL)
+  TIP_LIMIT=200
 """
 
 from __future__ import annotations
 
 import os
-import csv
 import json
 import time
-import math
 import random
+import math
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
@@ -49,18 +49,15 @@ from dotenv import load_dotenv
 
 import matplotlib
 matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
 from skyfield.api import EarthSatellite, load as sf_load
 
-try:
-    import simplekml
-except Exception:
-    simplekml = None
+import simplekml
 
 
 # -----------------------------
@@ -68,6 +65,10 @@ except Exception:
 # -----------------------------
 load_dotenv()
 LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
+DEFAULT_TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
+OUT_DIR = os.getenv("OUT_DIR", "./reentry_out")
+
+EARTH_RADIUS_KM = 6371.0088
 PH_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -82,15 +83,6 @@ class TipSolution:
     lat: Optional[float]
     lon: Optional[float]
     raw: dict
-
-
-@dataclass
-class TLEPoint:
-    epoch_utc: dt.datetime
-    name: str
-    l1: str
-    l2: str
-    bstar: float  # TLE B* drag term
 
 
 # -----------------------------
@@ -151,8 +143,8 @@ def parse_tip_solutions(tip_json: list) -> List[TipSolution]:
     for row in tip_json:
         sols.append(
             TipSolution(
-                msg_epoch=row.get("MSG_EPOCH") or "",
-                decay_epoch=row.get("DECAY_EPOCH") or "",
+                msg_epoch=(row.get("MSG_EPOCH") or "").strip(),
+                decay_epoch=(row.get("DECAY_EPOCH") or "").strip(),
                 rev=int(row["REV"]) if str(row.get("REV", "")).isdigit() else None,
                 lat=float(row["LAT"]) if row.get("LAT") not in (None, "") else None,
                 lon=float(row["LON"]) if row.get("LON") not in (None, "") else None,
@@ -169,21 +161,51 @@ def parse_tip_solutions(tip_json: list) -> List[TipSolution]:
     sols.sort(key=key, reverse=True)
     return sols
 
-def fetch_tip(session: requests.Session, norad_id: int, tip_url_override: str = "") -> list:
+def select_latest_tip_batch(solutions: List[TipSolution]) -> List[TipSolution]:
+    if not solutions:
+        return []
+    newest = solutions[0].msg_epoch
+    if not newest:
+        return solutions[:1]
+    return [s for s in solutions if s.msg_epoch == newest]
+
+def fetch_tip(session: requests.Session, norad_id: int, tip_url_override: str = "", limit: int = DEFAULT_TIP_LIMIT) -> list:
     if tip_url_override.strip():
         url = tip_url_override.strip()
     else:
         url = (
             f"https://www.space-track.org/basicspacedata/query/class/tip/"
-            f"NORAD_CAT_ID/{norad_id}/orderby/MSG_EPOCH%20desc/format/json"
+            f"NORAD_CAT_ID/{norad_id}/orderby/MSG_EPOCH%20desc/limit/{int(limit)}/format/json"
         )
     r = retry_get(session, url)
     txt = r.text.strip()
     return r.json() if txt.startswith("[") else json.loads(txt)
 
-def compute_tip_window(solutions: List[TipSolution], take_n: int = 10) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], List[dt.datetime]]:
+def fetch_latest_tle(session: requests.Session, norad_id: int) -> Tuple[str, str, str, dt.datetime]:
+    """
+    Returns (name, line1, line2, tle_epoch_utc) from latest GP entry.
+    """
+    url = (
+        f"https://www.space-track.org/basicspacedata/query/class/gp/"
+        f"NORAD_CAT_ID/{norad_id}/orderby/EPOCH%20desc/limit/1/format/json"
+    )
+    r = retry_get(session, url)
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("No latest TLE JSON returned.")
+    row = data[0]
+    name = row.get("OBJECT_NAME") or f"NORAD {norad_id}"
+    l1 = row.get("TLE_LINE1")
+    l2 = row.get("TLE_LINE2")
+    epoch_s = row.get("EPOCH")
+    if not (l1 and l2 and epoch_s):
+        raise RuntimeError("Latest TLE record missing fields.")
+    tle_epoch = dt.datetime.strptime(epoch_s.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+    return name, l1.strip(), l2.strip(), tle_epoch
+
+def compute_tip_window_from_batch(batch: List[TipSolution]) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], List[dt.datetime]]:
     decays: List[dt.datetime] = []
-    for s in solutions[:take_n]:
+    for s in batch:
         if s.decay_epoch:
             try:
                 decays.append(iso_to_dt_tip(s.decay_epoch))
@@ -193,93 +215,8 @@ def compute_tip_window(solutions: List[TipSolution], take_n: int = 10) -> Tuple[
         return None, None, []
     return min(decays), max(decays), decays
 
-def fetch_tle_history(session: requests.Session, norad_id: int, limit: int = 25) -> List[TLEPoint]:
-    """
-    Pull a recent sequence of TLEs to estimate an adaptive drag proxy.
-    """
-    url = (
-        f"https://www.space-track.org/basicspacedata/query/class/gp/"
-        f"NORAD_CAT_ID/{norad_id}/orderby/EPOCH%20desc/limit/{int(limit)}/format/json"
-    )
-    r = retry_get(session, url)
-    data = r.json()
-    if not isinstance(data, list) or not data:
-        raise RuntimeError("No TLE history returned.")
-
-    out: List[TLEPoint] = []
-    for row in data:
-        name = row.get("OBJECT_NAME") or f"NORAD {norad_id}"
-        l1 = row.get("TLE_LINE1")
-        l2 = row.get("TLE_LINE2")
-        epoch = row.get("EPOCH")
-        if not (l1 and l2 and epoch):
-            continue
-
-        # Space-Track EPOCH example: "2026-01-30 02:14:33"
-        try:
-            epoch_dt = dt.datetime.strptime(epoch.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            # sometimes ISO-like
-            epoch_dt = dt.datetime.fromisoformat(epoch.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
-
-        # Parse B* from TLE line 1 (columns 54-61-ish, scientific notation without 'E')
-        # Safer approach: read substring and convert
-        bstar = parse_bstar_from_tle_line1(l1)
-
-        out.append(TLEPoint(epoch_utc=epoch_dt, name=name, l1=l1.strip(), l2=l2.strip(), bstar=bstar))
-
-    # Sort oldest->newest for trend fitting
-    out.sort(key=lambda x: x.epoch_utc)
-    return out
-
-def parse_bstar_from_tle_line1(l1: str) -> float:
-    """
-    Standard TLE B* format: columns 54-61 (8 chars) like ' 34123-4'
-    which means +0.34123E-4.
-    """
-    try:
-        s = l1[53:61].strip()  # 0-indexed slice; may vary but ok for most TLEs
-        # Ensure sign exists
-        if len(s) < 7:
-            return float("nan")
-        # split mantissa and exponent (last 2 chars are exponent with sign)
-        mant = s[:-2]
-        exp = s[-2:]
-        # mantissa can include sign and decimal implied
-        sign = 1.0
-        if mant[0] == "-":
-            sign = -1.0
-            mant = mant[1:]
-        elif mant[0] == "+":
-            mant = mant[1:]
-
-        # implied decimal: 0.mant
-        mantissa = sign * float(f"0.{mant}")
-        exponent = int(exp)  # includes sign, e.g. -4
-        return mantissa * (10 ** exponent)
-    except Exception:
-        return float("nan")
-
-def robust_bstar_stats(tles: List[TLEPoint]) -> Dict[str, float]:
-    """
-    Digantara-style 'Adaptive BC from sequential TLE data' proxy:
-    we estimate a smoothed B* level and uncertainty from recent TLEs.
-    (True BC estimation requires mass/area/Cd and a full density model.)
-    """
-    vals = np.array([x.bstar for x in tles if np.isfinite(x.bstar)], dtype=float)
-    if len(vals) < 5:
-        return {"bstar_med": float("nan"), "bstar_mad": float("nan"), "bstar_trend_per_day": float("nan")}
-
-    # Robust center + spread
-    med = float(np.median(vals))
-    mad = float(np.median(np.abs(vals - med))) + 1e-30
-
-    # Trend (linear) on last N points
-    n = min(15, len(tles))
-    xs = np.array([(tles[-n+i].epoch_utc - tles[-n].epoch_utc).total_seconds() / 86400 for i in range(n)], dtype=float)
-    ys = np.array([tles[-n+i].bstar for i in range(n)], dtype=float)
-    m = float(np.polyfit(xs, ys, 1)[0])  # per day
-    return {"bstar_med": med, "bstar_mad": mad, "bstar_trend_per_day": m}
+def normalize_lon(lon: float) -> float:
+    return ((lon + 180) % 360) - 180
 
 def split_dateline_segments(lats: List[float], lons: List[float], jump_deg: float = 180.0):
     if not lats or not lons or len(lats) != len(lons):
@@ -288,7 +225,7 @@ def split_dateline_segments(lats: List[float], lons: List[float], jump_deg: floa
     cur_lat = [lats[0]]
     cur_lon = [lons[0]]
     for i in range(1, len(lats)):
-        if abs(lons[i] - lons[i-1]) > jump_deg:
+        if abs(lons[i] - lons[i - 1]) > jump_deg:
             segs.append((cur_lat, cur_lon))
             cur_lat = [lats[i]]
             cur_lon = [lons[i]]
@@ -298,16 +235,58 @@ def split_dateline_segments(lats: List[float], lons: List[float], jump_deg: floa
     segs.append((cur_lat, cur_lon))
     return segs
 
-def groundtrack_corridor(
+
+# -----------------------------
+# Spherical navigation helpers
+# -----------------------------
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Initial bearing from point1 to point2 (degrees from north).
+    """
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
+
+def destination_point(lat: float, lon: float, bearing: float, distance_km: float) -> Tuple[float, float]:
+    """
+    Great-circle destination on a sphere.
+    """
+    ang = distance_km / EARTH_RADIUS_KM
+    brng = math.radians(bearing)
+    phi1 = math.radians(lat)
+    lam1 = math.radians(lon)
+
+    phi2 = math.asin(math.sin(phi1) * math.cos(ang) + math.cos(phi1) * math.sin(ang) * math.cos(brng))
+    lam2 = lam1 + math.atan2(
+        math.sin(brng) * math.sin(ang) * math.cos(phi1),
+        math.cos(ang) - math.sin(phi1) * math.sin(phi2),
+    )
+
+    lat2 = math.degrees(phi2)
+    lon2 = normalize_lon(math.degrees(lam2))
+    return lat2, lon2
+
+
+# -----------------------------
+# Orbit / ground track
+# -----------------------------
+def groundtrack_for_span(
     sat: EarthSatellite,
     t_center: dt.datetime,
-    minutes_before: int,
-    minutes_after: int,
-    step_seconds: int
+    span_minutes: int,
+    step_seconds: int,
 ) -> Tuple[List[float], List[float], List[dt.datetime]]:
+    """
+    Ground track for [t_center - span_minutes, t_center + span_minutes]
+    """
     ts = sf_load.timescale()
-    start = t_center - dt.timedelta(minutes=minutes_before)
-    end = t_center + dt.timedelta(minutes=minutes_after)
+    start = t_center - dt.timedelta(minutes=span_minutes)
+    end = t_center + dt.timedelta(minutes=span_minutes)
 
     times_dt: List[dt.datetime] = []
     cur = start
@@ -316,12 +295,11 @@ def groundtrack_corridor(
         cur += dt.timedelta(seconds=step_seconds)
 
     t_sf = ts.from_datetimes(times_dt)
-    geoc = sat.at(t_sf)
-    sub = geoc.subpoint()
+    sub = sat.at(t_sf).subpoint()
 
     lats = list(sub.latitude.degrees)
     lons_raw = list(sub.longitude.degrees)
-    lons = [((x + 180) % 360) - 180 for x in lons_raw]
+    lons = [normalize_lon(x) for x in lons_raw]
     return lats, lons, times_dt
 
 def subpoint_at_time(sat: EarthSatellite, t_utc: dt.datetime) -> Tuple[float, float]:
@@ -329,143 +307,146 @@ def subpoint_at_time(sat: EarthSatellite, t_utc: dt.datetime) -> Tuple[float, fl
     t_sf = ts.from_datetime(t_utc)
     sub = sat.at(t_sf).subpoint()
     lat = float(sub.latitude.degrees)
-    lon = float(sub.longitude.degrees)
-    lon = ((lon + 180) % 360) - 180
+    lon = normalize_lon(float(sub.longitude.degrees))
     return lat, lon
 
 
 # -----------------------------
-# Uncertainty model (Monte Carlo)
+# Swath builder (±width_km around a polyline)
 # -----------------------------
-def mc_sample_reentry_time(
-    wmin: dt.datetime,
-    wmax: dt.datetime,
-    bstar_stats: Dict[str, float],
-    n: int = 1000,
-    seed: Optional[int] = None
-) -> np.ndarray:
+def build_swath_polygon(
+    track_lats: List[float],
+    track_lons: List[float],
+    half_width_km: float,
+) -> Tuple[List[float], List[float]]:
     """
-    Monte Carlo samples a reentry time inside the TIP window.
-
-    The idea:
-    - We keep the TIP window [wmin, wmax] as the bounding truth.
-    - We bias where inside the window we land, based on:
-      (a) B* level (higher drag proxy -> earlier)
-      (b) B* trend (increasing -> earlier)
-      (c) uncertainty from MAD
-
-    Output:
-    - array of UTC timestamps (POSIX seconds)
+    Build a single polygon (lat/lon lists) that buffers the track by ±half_width_km.
+    Output polygon is closed (first point repeated at end).
     """
-    if seed is not None:
-        np.random.seed(seed)
+    if len(track_lats) < 3:
+        raise ValueError("Track too short for swath polygon.")
 
-    width_s = max(1.0, (wmax - wmin).total_seconds())
-    mid = wmin + dt.timedelta(seconds=width_s / 2)
+    left_pts: List[Tuple[float, float]] = []
+    right_pts: List[Tuple[float, float]] = []
 
-    med = bstar_stats.get("bstar_med", float("nan"))
-    mad = bstar_stats.get("bstar_mad", float("nan"))
-    trend = bstar_stats.get("bstar_trend_per_day", float("nan"))
+    n = len(track_lats)
+    for i in range(n):
+        if i == 0:
+            brng = bearing_deg(track_lats[i], track_lons[i], track_lats[i + 1], track_lons[i + 1])
+        elif i == n - 1:
+            brng = bearing_deg(track_lats[i - 1], track_lons[i - 1], track_lats[i], track_lons[i])
+        else:
+            b1 = bearing_deg(track_lats[i - 1], track_lons[i - 1], track_lats[i], track_lons[i])
+            b2 = bearing_deg(track_lats[i], track_lons[i], track_lats[i + 1], track_lons[i + 1])
+            # average bearing safely (vector average)
+            x = math.cos(math.radians(b1)) + math.cos(math.radians(b2))
+            y = math.sin(math.radians(b1)) + math.sin(math.radians(b2))
+            brng = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
-    # Normalize into a soft bias scalar in [-0.35, +0.35]
-    # (tunable; chosen to stay conservative and remain within TIP bounds)
-    bias = 0.0
-    if np.isfinite(med):
-        # Typical B* magnitude can vary widely; we use log scale.
-        bias += -0.10 * np.tanh(math.log10(abs(med) + 1e-12) + 7.0)  # heuristic center
-    if np.isfinite(trend):
-        bias += -0.10 * np.tanh(trend * 5e4)  # trend sensitivity heuristic
+        left_bearing = (brng - 90.0) % 360.0
+        right_bearing = (brng + 90.0) % 360.0
 
-    bias = float(np.clip(bias, -0.25, +0.25))
+        latL, lonL = destination_point(track_lats[i], track_lons[i], left_bearing, half_width_km)
+        latR, lonR = destination_point(track_lats[i], track_lons[i], right_bearing, half_width_km)
 
-    # Spread: larger MAD -> flatter distribution
-    flatness = 0.5
-    if np.isfinite(mad) and np.isfinite(med) and abs(med) > 0:
-        rel = mad / (abs(med) + 1e-30)
-        flatness = float(np.clip(0.35 + 2.0 * rel, 0.35, 0.95))
+        left_pts.append((latL, lonL))
+        right_pts.append((latR, lonR))
 
-    # Build a beta distribution over [0,1] and shift its mean by bias
-    # Mean of Beta(a,b) = a/(a+b). We map to a,b.
-    base_mean = 0.5 + bias
-    base_mean = float(np.clip(base_mean, 0.10, 0.90))
-
-    # Concentration controls peaked vs flat
-    k = (1.0 - flatness) * 18.0 + 2.0  # in [2..20]
-    a = base_mean * k
-    b = (1.0 - base_mean) * k
-
-    u = np.random.beta(a, b, size=int(n))
-    ts = np.array([wmin.timestamp() + float(x) * width_s for x in u], dtype=float)
-    return ts
+    # polygon: left forward + right backward
+    poly = left_pts + right_pts[::-1] + [left_pts[0]]
+    poly_lats = [p[0] for p in poly]
+    poly_lons = [p[1] for p in poly]
+    return poly_lats, poly_lons
 
 
 # -----------------------------
-# KML exporters
+# KML export (EU SST style: Point + Line + Swath)
 # -----------------------------
-def export_kml_corridor(path: str, tracks: List[Dict[str, Any]]) -> None:
-    """
-    tracks: [{name: str, lats: [...], lons: [...]}]
-    """
-    if simplekml is None:
-        raise RuntimeError("simplekml not installed. pip install simplekml")
-
+def export_products_kml(
+    out_path: str,
+    obj_name: str,
+    reentry_epoch_utc: dt.datetime,
+    window_start_utc: dt.datetime,
+    window_end_utc: dt.datetime,
+    point_lat: float,
+    point_lon: float,
+    track_lats: List[float],
+    track_lons: List[float],
+    swath_poly_lats: List[float],
+    swath_poly_lons: List[float],
+    swath_half_width_km: float,
+) -> None:
     kml = simplekml.Kml()
-    for tr in tracks:
-        ls = kml.newlinestring(name=tr["name"])
-        coords = list(zip(tr["lons"], tr["lats"]))
-        ls.coords = coords
-        ls.altitudemode = simplekml.AltitudeMode.clamptoground
-        ls.extrude = 0
+    kml.document.name = f"{obj_name} Reentry Products"
 
-    kml.save(path)
+    desc = (
+        f"Object: {obj_name}\n"
+        f"Reentry epoch (centre of window): {dt_to_iso_z(reentry_epoch_utc)} | {dt_to_iso_ph(reentry_epoch_utc)}\n"
+        f"Window start: {dt_to_iso_z(window_start_utc)}\n"
+        f"Window end:   {dt_to_iso_z(window_end_utc)}\n"
+        f"Swath: ±{swath_half_width_km:.0f} km\n"
+        "CRS: WGS84 (EPSG:4326)\n"
+    )
 
-def export_kml_footprint(path: str, center_lat: float, center_lon: float, radius_km: float, n: int = 72) -> None:
-    """
-    Simple circular footprint polygon (proxy).
-    """
-    if simplekml is None:
-        raise RuntimeError("simplekml not installed. pip install simplekml")
+    fol = kml.newfolder(name="Products")
 
-    # Rough conversion: 1 deg lat ~ 111 km; lon scale by cos(lat)
-    lat0 = math.radians(center_lat)
-    dlat = radius_km / 111.0
-    dlon = radius_km / (111.0 * max(0.2, math.cos(lat0)))
+    # Point (centre of window)
+    p = fol.newpoint(name="Re-entry Point (centre of window)", coords=[(point_lon, point_lat)])
+    p.description = desc
+    p.style.iconstyle.scale = 1.2
+    p.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/shapes/target.png"
 
-    pts = []
-    for i in range(n + 1):
-        ang = 2 * math.pi * i / n
-        lat = center_lat + dlat * math.sin(ang)
-        lon = center_lon + dlon * math.cos(ang)
-        lon = ((lon + 180) % 360) - 180
-        pts.append((lon, lat))
+    # Ground track
+    ls = fol.newlinestring(name="Re-entry Ground Track")
+    ls.description = desc
+    ls.coords = list(zip(track_lons, track_lats))
+    ls.altitudemode = simplekml.AltitudeMode.clamptoground
+    ls.extrude = 0
+    ls.style.linestyle.width = 4
+    ls.style.linestyle.color = simplekml.Color.rgb(0, 180, 0)  # green-ish
 
-    kml = simplekml.Kml()
-    pol = kml.newpolygon(name=f"Footprint ~{radius_km:.0f} km (proxy)")
-    pol.outerboundaryis = pts
-    pol.style.polystyle.fill = 0
-    kml.save(path)
+    # Swath polygon
+    pol = fol.newpolygon(name=f"Re-entry Swath (±{int(round(swath_half_width_km))} km)")
+    pol.description = desc
+    pol.outerboundaryis = list(zip(swath_poly_lons, swath_poly_lats))
+    pol.altitudemode = simplekml.AltitudeMode.clamptoground
+    pol.style.linestyle.width = 2
+    pol.style.linestyle.color = simplekml.Color.rgb(0, 120, 255)  # blue-ish outline
+    pol.style.polystyle.color = simplekml.Color.changealphaint(70, simplekml.Color.rgb(0, 120, 255))  # semi-transparent fill
+
+    kml.save(out_path)
 
 
 # -----------------------------
 # GUI
 # -----------------------------
-class ReentryAssessmentGUI(tk.Tk):
+class ReentryProductsGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Re-entry Prediction & Assessment Tool (TIP + Seq TLE + Monte Carlo)")
+        self.title("Reentry Products (TIP + TLE) — EU SST-aligned (Point + Track + Swath + KML)")
         self.geometry("1320x900")
 
-        self.out_dir = os.getenv("OUT_DIR", "./reentry_out")
-        ensure_dir(self.out_dir)
+        ensure_dir(OUT_DIR)
 
         # State
         self.tip_raw: Optional[list] = None
-        self.solutions: List[TipSolution] = []
-        self.window_min: Optional[dt.datetime] = None
-        self.window_max: Optional[dt.datetime] = None
+        self.solutions_all: List[TipSolution] = []
+        self.solutions_latest: List[TipSolution] = []
 
-        self.tle_hist: List[TLEPoint] = []
-        self.bstar_stats: Dict[str, float] = {}
+        self.window_start: Optional[dt.datetime] = None
+        self.window_end: Optional[dt.datetime] = None
+        self.window_mid: Optional[dt.datetime] = None
+
+        self.obj_name: str = ""
+        self.tle_epoch: Optional[dt.datetime] = None
+        self.latest_sat: Optional[EarthSatellite] = None
+
+        # Cached products
+        self.prod_point: Optional[Tuple[float, float]] = None
+        self.prod_track: Tuple[List[float], List[float]] = ([], [])
+        self.prod_swath: Tuple[List[float], List[float]] = ([], [])
+
+        self.assessment: Dict[str, Any] = {}
 
         # UI vars
         self.var_user = tk.StringVar(value=os.getenv("SPACE_TRACK_USERNAME", ""))
@@ -473,25 +454,10 @@ class ReentryAssessmentGUI(tk.Tk):
         self.var_norad = tk.StringVar(value=os.getenv("NORAD_CAT_ID", "66877"))
         self.var_tip_url = tk.StringVar(value=os.getenv("TIP_URL", ""))
 
-        self.var_tip_rows = tk.StringVar(value="10")
-        self.var_tle_hist = tk.StringVar(value="25")
-
-        self.var_before = tk.StringVar(value="90")
-        self.var_after = tk.StringVar(value="90")
-        self.var_step = tk.StringVar(value="30")
-        self.var_mid_tracks = tk.StringVar(value="6")
-
-        self.var_mc_n = tk.StringVar(value="1500")
-        self.var_conf_lo = tk.StringVar(value="10")
-        self.var_conf_hi = tk.StringVar(value="90")
-
-        # Breakup proxy knobs
-        self.var_breakup_enable = tk.BooleanVar(value=False)
-        self.var_breakup_radius_km = tk.StringVar(value="250")  # proxy footprint
-
-        # Derived outputs
-        self.latest_sat: Optional[EarthSatellite] = None
-        self.assessment: Dict[str, Any] = {}
+        self.var_step = tk.StringVar(value="30")          # seconds
+        self.var_span = tk.StringVar(value="90")          # minutes around reentry epoch
+        self.var_swath = tk.StringVar(value="100")        # km (±)
+        self.var_ph_focus = tk.BooleanVar(value=False)    # optional zoom toggle
 
         self._build_ui()
         self._build_plot()
@@ -512,40 +478,29 @@ class ReentryAssessmentGUI(tk.Tk):
         ttk.Label(top, text="TIP_URL (optional override)").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.var_tip_url, width=120).grid(row=1, column=1, columnspan=5, sticky="we", pady=(8, 0))
 
-        row2 = ttk.Frame(self, padding=(10, 0, 10, 6))
+        row2 = ttk.Frame(self, padding=(10, 0, 10, 10))
         row2.pack(side=tk.TOP, fill=tk.X)
 
-        def add_field(label: str, var: tk.StringVar, w: int = 7):
+        def add_field(label: str, var: tk.StringVar, w: int = 8):
             ttk.Label(row2, text=label).pack(side=tk.LEFT)
             ttk.Entry(row2, textvariable=var, width=w).pack(side=tk.LEFT, padx=(6, 14))
 
-        add_field("TIP rows", self.var_tip_rows, 7)
-        add_field("TLE hist", self.var_tle_hist, 7)
-        add_field("Before (min)", self.var_before, 7)
-        add_field("After (min)", self.var_after, 7)
-        add_field("Step (sec)", self.var_step, 7)
-        add_field("Mid tracks", self.var_mid_tracks, 7)
-        add_field("MC N", self.var_mc_n, 8)
-        add_field("Conf lo %", self.var_conf_lo, 7)
-        add_field("Conf hi %", self.var_conf_hi, 7)
+        add_field("Step (sec)", self.var_step, 8)
+        add_field("Track span ± (min)", self.var_span, 10)
+        add_field("Swath ± (km)", self.var_swath, 9)
 
-        row3 = ttk.Frame(self, padding=(10, 0, 10, 10))
-        row3.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Checkbutton(row3, text="Enable breakup footprint (proxy)", variable=self.var_breakup_enable).pack(side=tk.LEFT)
-        ttk.Label(row3, text="Footprint radius (km)").pack(side=tk.LEFT, padx=(12, 6))
-        ttk.Entry(row3, textvariable=self.var_breakup_radius_km, width=7).pack(side=tk.LEFT)
+        ttk.Checkbutton(row2, text="Philippines focus (zoom)", variable=self.var_ph_focus, command=self._apply_extent).pack(side=tk.LEFT, padx=12)
 
         btns = ttk.Frame(self, padding=(10, 0, 10, 10))
         btns.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(btns, text="Fetch TIP + TLE History", command=self.on_fetch).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Run Assessment (MC + Corridor)", command=self.on_assess).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Fetch TIP + Latest TLE", command=self.on_fetch).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Generate Products (Point + Track + Swath)", command=self.on_generate).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Save Outputs (JSON/KML/PNG)…", command=self.on_save).pack(side=tk.LEFT, padx=8)
 
         self.status = tk.Text(self, height=14)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
-        self._log("Ready. Fetch TIP+TLE history → Run Assessment → Save outputs.")
+        self._log("Ready. Fetch → Generate Products → Save KML for your colleague/QGIS.")
 
     def _build_plot(self):
         center = ttk.Frame(self, padding=10)
@@ -567,6 +522,17 @@ class ReentryAssessmentGUI(tk.Tk):
         self.ax.add_feature(cfeature.LAND, alpha=0.2)
         self.ax.add_feature(cfeature.OCEAN, alpha=0.1)
         self.ax.gridlines(draw_labels=False, linewidth=0.4, alpha=0.5)
+        self._apply_extent()
+
+    def _apply_extent(self):
+        if getattr(self, "ax", None) is None:
+            return
+        if self.var_ph_focus.get():
+            self.ax.set_extent([115, 135, 0, 25], crs=ccrs.PlateCarree())
+        else:
+            self.ax.set_global()
+        if getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
 
     def _log(self, msg: str):
         ts = dt.datetime.now().strftime("%H:%M:%S")
@@ -591,168 +557,132 @@ class ReentryAssessmentGUI(tk.Tk):
             pw = self.var_pass.get().strip()
             norad = self._get_int(self.var_norad, "NORAD_CAT_ID")
             tip_url_override = self.var_tip_url.get().strip()
-            tip_rows = self._get_int(self.var_tip_rows, "TIP rows")
-            tle_n = self._get_int(self.var_tle_hist, "TLE hist")
 
             self._log("Logging in to Space-Track…")
             session = spacetrack_login(user, pw)
 
-            self._log("Fetching TIP…")
-            self.tip_raw = fetch_tip(session, norad, tip_url_override)
-            self.solutions = parse_tip_solutions(self.tip_raw)
-            wmin, wmax, decays = compute_tip_window(self.solutions, take_n=tip_rows)
-            self.window_min, self.window_max = wmin, wmax
+            self._log(f"Fetching TIP (limit={DEFAULT_TIP_LIMIT})…")
+            self.tip_raw = fetch_tip(session, norad, tip_url_override, limit=DEFAULT_TIP_LIMIT)
+            self.solutions_all = parse_tip_solutions(self.tip_raw)
+            self.solutions_latest = select_latest_tip_batch(self.solutions_all)
 
+            if not self.solutions_latest:
+                raise RuntimeError("No TIP solutions in latest batch.")
+
+            wmin, wmax, decays = compute_tip_window_from_batch(self.solutions_latest)
             if not (wmin and wmax):
-                raise RuntimeError("TIP did not yield a usable decay window (DECAY_EPOCH missing/unparsable).")
+                raise RuntimeError("Latest TIP batch has no usable DECAY_EPOCH values to form a window.")
 
-            self._log(f"TIP window: {dt_to_iso_z(wmin)} → {dt_to_iso_z(wmax)} (width {fmt_timedelta(wmax - wmin)})")
-            self._log("Fetching sequential TLE history…")
-            self.tle_hist = fetch_tle_history(session, norad, limit=tle_n)
-            self.bstar_stats = robust_bstar_stats(self.tle_hist)
+            self.window_start = wmin
+            self.window_end = wmax
+            self.window_mid = wmin + (wmax - wmin) / 2
 
-            # Build EarthSatellite from most recent TLE
-            latest = self.tle_hist[-1]
+            latest_msg_epoch = self.solutions_latest[0].msg_epoch
+            self._log(f"Latest TIP MSG_EPOCH used: {latest_msg_epoch} | batch rows: {len(self.solutions_latest)}")
+            self._log(f"Window start: {dt_to_iso_z(wmin)} | end: {dt_to_iso_z(wmax)} | width: {fmt_timedelta(wmax-wmin)}")
+            self._log(f"Reentry epoch (centre of window): {dt_to_iso_z(self.window_mid)} | {dt_to_iso_ph(self.window_mid)}")
+
+            self._log("Fetching latest TLE…")
+            name, l1, l2, tle_epoch = fetch_latest_tle(session, norad)
+            self.obj_name = name
+            self.tle_epoch = tle_epoch
+
             ts = sf_load.timescale()
-            self.latest_sat = EarthSatellite(latest.l1, latest.l2, latest.name, ts)
+            self.latest_sat = EarthSatellite(l1, l2, name, ts)
 
-            self._log(
-                f"TLE hist loaded: {len(self.tle_hist)} | "
-                f"B* median={self.bstar_stats.get('bstar_med', float('nan')):.3e} "
-                f"MAD={self.bstar_stats.get('bstar_mad', float('nan')):.3e} "
-                f"trend/day={self.bstar_stats.get('bstar_trend_per_day', float('nan')):.3e}"
-            )
+            self._log(f"TLE used epoch: {dt_to_iso_z(tle_epoch)} | Object: {name}")
 
         except Exception as e:
             messagebox.showerror("Fetch error", str(e))
             self._log(f"ERROR: {e}")
 
-    def _plot_track(self, lats: List[float], lons: List[float], linewidth: float, alpha: float):
+    def _plot_track(self, lats: List[float], lons: List[float], linewidth: float, alpha: float, linestyle: str = "-"):
         for seg_lat, seg_lon in split_dateline_segments(lats, lons):
-            self.ax.plot(seg_lon, seg_lat, transform=ccrs.PlateCarree(), linewidth=linewidth, alpha=alpha)
+            self.ax.plot(seg_lon, seg_lat, transform=ccrs.PlateCarree(),
+                         linewidth=linewidth, alpha=alpha, linestyle=linestyle)
 
-    def on_assess(self):
+    def on_generate(self):
         try:
-            if not (self.latest_sat and self.window_min and self.window_max):
-                raise RuntimeError("Fetch TIP + TLE history first.")
+            if not (self.latest_sat and self.window_start and self.window_end and self.window_mid):
+                raise RuntimeError("Fetch TIP + latest TLE first.")
 
-            before_min = self._get_int(self.var_before, "Before (min)")
-            after_min = self._get_int(self.var_after, "After (min)")
-            step_s = self._get_int(self.var_step, "Step (sec)")
-            mid_tracks = max(0, min(20, self._get_int(self.var_mid_tracks, "Mid tracks")))
+            step_s = max(5, min(600, self._get_int(self.var_step, "Step (sec)")))
+            span_min = max(5, min(360, self._get_int(self.var_span, "Track span (min)")))
+            swath_km = max(1.0, min(2000.0, self._get_float(self.var_swath, "Swath (km)")))
 
-            mc_n = max(200, min(20000, self._get_int(self.var_mc_n, "MC N")))
-            conf_lo = float(np.clip(self._get_float(self.var_conf_lo, "Conf lo %"), 0, 49))
-            conf_hi = float(np.clip(self._get_float(self.var_conf_hi, "Conf hi %"), 51, 100))
+            re_t = self.window_mid
 
-            wmin = self.window_min
-            wmax = self.window_max
-            width = wmax - wmin
-            t_mid = wmin + dt.timedelta(seconds=width.total_seconds() / 2)
+            # Re-entry point = subpoint at centre-of-window time (EU SST style)
+            lat0, lon0 = subpoint_at_time(self.latest_sat, re_t)
+            self.prod_point = (lat0, lon0)
 
-            # Monte Carlo confidence window
-            ts_samples = mc_sample_reentry_time(wmin, wmax, self.bstar_stats, n=mc_n)
-            t_lo = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, conf_lo)), tz=dt.timezone.utc)
-            t_hi = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, conf_hi)), tz=dt.timezone.utc)
-            t_exp = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 50)), tz=dt.timezone.utc)
+            # Ground track around reentry epoch
+            lats, lons, times_dt = groundtrack_for_span(self.latest_sat, re_t, span_minutes=span_min, step_seconds=step_s)
+            self.prod_track = (lats, lons)
 
-            # Impact subpoints (proxy: subpoint at sampled time; true impact point requires descent model)
-            lat_exp, lon_exp = subpoint_at_time(self.latest_sat, t_exp)
-            lat_lo, lon_lo = subpoint_at_time(self.latest_sat, t_lo)
-            lat_hi, lon_hi = subpoint_at_time(self.latest_sat, t_hi)
+            # Swath polygon around that track (±swath_km)
+            poly_lats, poly_lons = build_swath_polygon(lats, lons, half_width_km=swath_km)
+            self.prod_swath = (poly_lats, poly_lons)
 
-            # Plot corridor envelope like your current script, but add MC confidence markers
+            # Plot (similar layering: swath, track, point)
             self._setup_map()
 
-            # faint intermediates across TIP
-            if mid_tracks > 0 and width.total_seconds() > 0:
-                for i in range(1, mid_tracks + 1):
-                    frac = i / (mid_tracks + 1)
-                    t_i = wmin + dt.timedelta(seconds=width.total_seconds() * frac)
-                    lats_i, lons_i, _ = groundtrack_corridor(self.latest_sat, t_i, before_min, after_min, step_s)
-                    self._plot_track(lats_i, lons_i, linewidth=0.9, alpha=0.22)
+            # Swath (plot outline only; fill would need extra handling in matplotlib)
+            for seg_lat, seg_lon in split_dateline_segments(poly_lats, poly_lons):
+                self.ax.plot(seg_lon, seg_lat, transform=ccrs.PlateCarree(),
+                             linewidth=1.5, alpha=0.9, linestyle="-")
 
-            lats_min, lons_min, _ = groundtrack_corridor(self.latest_sat, wmin, before_min, after_min, step_s)
-            lats_max, lons_max, _ = groundtrack_corridor(self.latest_sat, wmax, before_min, after_min, step_s)
-            self._plot_track(lats_min, lons_min, linewidth=1.7, alpha=0.92)
-            self._plot_track(lats_max, lons_max, linewidth=1.7, alpha=0.92)
+            # Track
+            self._plot_track(lats, lons, linewidth=2.2, alpha=0.95, linestyle="-")
 
-            # markers: expected + conf bounds
-            self.ax.plot([lon_exp], [lat_exp], marker="o", markersize=8, transform=ccrs.PlateCarree())
-            self.ax.plot([lon_lo], [lat_lo], marker="o", markersize=6, transform=ccrs.PlateCarree())
-            self.ax.plot([lon_hi], [lat_hi], marker="o", markersize=6, transform=ccrs.PlateCarree())
-            self.ax.text(lon_exp + 2, lat_exp + 2, "Expected (P50)", transform=ccrs.PlateCarree(), fontsize=9)
-            self.ax.text(lon_lo + 2, lat_lo - 2, f"P{conf_lo:.0f}", transform=ccrs.PlateCarree(), fontsize=9)
-            self.ax.text(lon_hi + 2, lat_hi - 2, f"P{conf_hi:.0f}", transform=ccrs.PlateCarree(), fontsize=9)
+            # Point
+            self.ax.plot([lon0], [lat0], marker="o", markersize=7, transform=ccrs.PlateCarree(), linestyle="None")
 
-            self.ax.set_title(
-                f"{self.latest_sat.name} — TIP window {dt_to_iso_z(wmin)} → {dt_to_iso_z(wmax)} (width {fmt_timedelta(width)})\n"
-                f"MC expected: {dt_to_iso_z(t_exp)} | {dt_to_iso_ph(t_exp)}  |  "
-                f"Confidence: P{conf_lo:.0f}={dt_to_iso_z(t_lo)} … P{conf_hi:.0f}={dt_to_iso_z(t_hi)}"
+            title = (
+                f"{self.obj_name}\n"
+                f"Reentry epoch (centre): {dt_to_iso_z(re_t)} | Window: {dt_to_iso_z(self.window_start)} → {dt_to_iso_z(self.window_end)} | "
+                f"Swath: ±{int(round(swath_km))} km"
             )
-
+            self.ax.set_title(title)
             self.canvas.draw()
-
-            # Optional breakup footprint (proxy)
-            breakup_enabled = bool(self.var_breakup_enable.get())
-            footprint_radius_km = float(self._get_float(self.var_breakup_radius_km, "Footprint radius (km)"))
 
             self.assessment = {
                 "generated_utc": dt_to_iso_z(dt.datetime.now(dt.timezone.utc)),
                 "norad_id": int(self.var_norad.get().strip()),
-                "tle_used_epoch_utc": dt_to_iso_z(self.tle_hist[-1].epoch_utc) if self.tle_hist else None,
+                "object_name": self.obj_name,
+                "tle_used_epoch_utc": dt_to_iso_z(self.tle_epoch) if self.tle_epoch else None,
+                "tip_latest_msg_epoch": self.solutions_latest[0].msg_epoch if self.solutions_latest else None,
                 "tip_window": {
-                    "start_utc": dt_to_iso_z(wmin),
-                    "end_utc": dt_to_iso_z(wmax),
-                    "width_sec": int(width.total_seconds()),
+                    "start_utc": dt_to_iso_z(self.window_start),
+                    "end_utc": dt_to_iso_z(self.window_end),
+                    "width_sec": int((self.window_end - self.window_start).total_seconds()),
+                    "centre_utc": dt_to_iso_z(self.window_mid),
                 },
-                "adaptive_drag_proxy": {
-                    "bstar_median": self.bstar_stats.get("bstar_med"),
-                    "bstar_mad": self.bstar_stats.get("bstar_mad"),
-                    "bstar_trend_per_day": self.bstar_stats.get("bstar_trend_per_day"),
-                    "notes": "Adaptive drag proxy derived from sequential TLE B*; serves as uncertainty bias only (not true ballistic coefficient).",
+                "products": {
+                    "reentry_point_centre_of_window": {"lat_deg": lat0, "lon_deg": lon0},
+                    "ground_track": {
+                        "span_minutes_each_side": span_min,
+                        "step_seconds": step_s,
+                        "num_points": len(lats),
+                    },
+                    "swath": {"half_width_km": swath_km, "method": "spherical left/right offsets from track bearings"},
                 },
-                "monte_carlo": {
-                    "n": int(mc_n),
-                    "confidence_percentiles": [conf_lo, 50.0, conf_hi],
-                    "t_lo_utc": dt_to_iso_z(t_lo),
-                    "t_p50_utc": dt_to_iso_z(t_exp),
-                    "t_hi_utc": dt_to_iso_z(t_hi),
-                },
-                "predicted_impact_proxy": {
-                    "t_p50_utc": dt_to_iso_z(t_exp),
-                    "lat_deg": lat_exp,
-                    "lon_deg": lon_exp,
-                    "method": "Subpoint at P50 time (proxy). True impact requires descent/fragmentation physics.",
-                },
-                "confidence_impact_proxy": {
-                    f"p{int(conf_lo)}": {"t_utc": dt_to_iso_z(t_lo), "lat_deg": lat_lo, "lon_deg": lon_lo},
-                    f"p{int(conf_hi)}": {"t_utc": dt_to_iso_z(t_hi), "lat_deg": lat_hi, "lon_deg": lon_hi},
-                },
-                "breakup_proxy": {
-                    "enabled": breakup_enabled,
-                    "radius_km": footprint_radius_km if breakup_enabled else None,
-                    "notes": "Simple footprint circle for ops visualization only (proxy).",
-                },
-                "corridor": {
-                    "minutes_before": before_min,
-                    "minutes_after": after_min,
-                    "step_seconds": step_s,
-                },
+                "notes": [
+                    "EU SST-aligned operational products: point=centre-of-window, track around point, swath=±width around track.",
+                    "This is not a high-fidelity reentry physics model.",
+                ],
             }
 
-            self._log(f"MC expected time: {dt_to_iso_z(t_exp)} | {dt_to_iso_ph(t_exp)}")
-            self._log(f"Confidence window: P{conf_lo:.0f}={dt_to_iso_z(t_lo)} … P{conf_hi:.0f}={dt_to_iso_z(t_hi)}")
-            self._log(f"Expected impact proxy: lat={lat_exp:.2f}, lon={lon_exp:.2f}")
+            self._log(f"Generated products. Point: lat={lat0:.4f}, lon={lon0:.4f}. Track points: {len(lats)}. Swath: ±{swath_km:.0f} km.")
 
         except Exception as e:
-            messagebox.showerror("Assessment error", str(e))
+            messagebox.showerror("Generate error", str(e))
             self._log(f"ERROR: {e}")
 
     def on_save(self):
         try:
-            if not self.assessment:
-                raise RuntimeError("Run Assessment first.")
+            if not (self.assessment and self.prod_point and self.prod_track[0] and self.prod_swath[0]):
+                raise RuntimeError("Generate Products first.")
 
             folder = filedialog.askdirectory(title="Select folder to save outputs")
             if not folder:
@@ -761,41 +691,41 @@ class ReentryAssessmentGUI(tk.Tk):
             norad = int(self.var_norad.get().strip())
             stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-            # JSON summary (Digantara-like output object)
-            json_path = os.path.join(folder, f"assessment_{norad}_{stamp}.json")
+            # JSON
+            json_path = os.path.join(folder, f"products_{norad}_{stamp}.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(self.assessment, f, indent=2)
 
             # PNG
-            png_path = os.path.join(folder, f"corridor_{norad}_{stamp}.png")
+            png_path = os.path.join(folder, f"products_{norad}_{stamp}.png")
             self.fig.savefig(png_path, dpi=220)
 
-            # KML corridor + optional footprint
-            if simplekml is not None and self.latest_sat and self.window_min and self.window_max:
-                before_min = self._get_int(self.var_before, "Before (min)")
-                after_min = self._get_int(self.var_after, "After (min)")
-                step_s = self._get_int(self.var_step, "Step (sec)")
+            # KML (single file containing Point+Track+Swath)
+            lat0, lon0 = self.prod_point
+            lats, lons = self.prod_track
+            poly_lats, poly_lons = self.prod_swath
+            swath_km = float(self.assessment["products"]["swath"]["half_width_km"])
 
-                # KML tracks for min/max and expected
-                t_exp = dt.datetime.strptime(self.assessment["predicted_impact_proxy"]["t_p50_utc"], "%Y-%m-%d %H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-                tracks = []
-                for nm, tt in [("TIP_min", self.window_min), ("TIP_max", self.window_max), ("MC_P50", t_exp)]:
-                    lats, lons, _ = groundtrack_corridor(self.latest_sat, tt, before_min, after_min, step_s)
-                    tracks.append({"name": nm, "lats": lats, "lons": lons})
+            kml_path = os.path.join(folder, f"products_{norad}_{stamp}.kml")
+            export_products_kml(
+                out_path=kml_path,
+                obj_name=self.obj_name,
+                reentry_epoch_utc=self.window_mid,  # centre-of-window
+                window_start_utc=self.window_start,
+                window_end_utc=self.window_end,
+                point_lat=lat0,
+                point_lon=lon0,
+                track_lats=lats,
+                track_lons=lons,
+                swath_poly_lats=poly_lats,
+                swath_poly_lons=poly_lons,
+                swath_half_width_km=swath_km,
+            )
 
-                kml_corr = os.path.join(folder, f"corridor_{norad}_{stamp}.kml")
-                export_kml_corridor(kml_corr, tracks)
-
-                # Footprint circle (proxy)
-                if bool(self.var_breakup_enable.get()):
-                    lat = float(self.assessment["predicted_impact_proxy"]["lat_deg"])
-                    lon = float(self.assessment["predicted_impact_proxy"]["lon_deg"])
-                    rad = float(self._get_float(self.var_breakup_radius_km, "Footprint radius (km)"))
-                    kml_fp = os.path.join(folder, f"footprint_proxy_{norad}_{stamp}.kml")
-                    export_kml_footprint(kml_fp, lat, lon, rad)
-
-            messagebox.showinfo("Saved", "Outputs saved successfully.")
-            self._log(f"Saved: {folder}")
+            messagebox.showinfo("Saved", "Saved JSON + PNG + KML successfully.")
+            self._log(f"Saved JSON: {json_path}")
+            self._log(f"Saved PNG : {png_path}")
+            self._log(f"Saved KML : {kml_path}")
 
         except Exception as e:
             messagebox.showerror("Save error", str(e))
@@ -803,8 +733,9 @@ class ReentryAssessmentGUI(tk.Tk):
 
 
 def main():
-    app = ReentryAssessmentGUI()
+    app = ReentryProductsGUI()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
