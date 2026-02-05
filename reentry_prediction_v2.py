@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
 """
-Reentry Monitor GUI (TIP + TLE) — Latest TIP Only + Map Envelope + Kp Prediction + KML Export
+Reentry Monitor (TIP + TLE) — Latest TIP Only + Map Envelope + Refined Prediction (TIP LAT/LON + Kp-nearest + MeanMotion trend) + KML
 
-Keeps your GUI layout (Fetch / Plot / Run Prediction / Export KML / Save Outputs).
+Key refinement to get closer to EU-SST-like "red dot":
+- Use Space-Track TIP-provided LAT/LON for the predicted decay point whenever available (DEFAULT ON).
+  This is typically far closer to authoritative products than computing a subpoint from a single TLE.
 
-Fixes:
-- TIP timestamps with fractional seconds now parse correctly
-- TIP window width = 0s (single decay epoch) auto-expands to ±DEFAULT_ZERO_WIDTH_MINUTES
-  so MC + prediction can run
+Other refinements:
+- Use NOAA Planetary Kp at the time closest to the predicted epoch (not last-24h max).
+- Add sequential TLE mean-motion trend as a decay proxy (stronger than B* alone).
+- If TIP window width is 0 seconds, auto-expand for MC sampling but keep center anchored.
 
-Adds:
-- NOAA SWPC Planetary Kp fetch (3-hour intervals JSON)
-- Kp + sequential TLE B* drag proxy bias the reentry time inside the TIP window
-- Prediction outputs: P10/P50/P90 times and points
-- KML export: corridor tracks (TIP_min/TIP_max/P50) + swath polygon + P10/P50/P90 points
-
-Notes:
-- This is still an operational proxy (like your earlier approach). It is NOT a full aerothermal breakup solver.
-- Kp is used as a density/drag proxy to bias timing inside the TIP window.
-
-Requirements:
-  pip install requests skyfield matplotlib python-dotenv cartopy numpy simplekml
+DISCLAIMER:
+- This is still an operational proxy. True debris footprint requires high-fidelity reentry/breakup/winds.
 """
 
 from __future__ import annotations
@@ -59,23 +51,19 @@ except Exception:
 
 
 # -----------------------------
-# Load env
+# Config
 # -----------------------------
 load_dotenv()
 
 LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 DEFAULT_TIP_LIMIT = int(os.getenv("TIP_LIMIT", "200"))
-
-# If latest TIP batch collapses to a single decay epoch -> expand to ± this many minutes
-DEFAULT_ZERO_WIDTH_MINUTES = int(os.getenv("ZERO_WIDTH_FALLBACK_MIN", "30"))
-
 PH_TZ = dt.timezone(dt.timedelta(hours=8))
 
-# NOAA SWPC Kp products (3-hour planetary K index)
-# Linked from the Planetary K-index product page. :contentReference[oaicite:1]{index=1}
-NOAA_KP_JSON_PRIMARY = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-# Backup (sometimes present for 30-day indices; may not include the same schema)
-NOAA_KP_JSON_BACKUP = "https://services.swpc.noaa.gov/products/kyoto-dst.json"  # not Kp; used only if primary down
+# When latest TIP batch collapses to a single decay epoch
+DEFAULT_ZERO_WIDTH_MINUTES = int(os.getenv("ZERO_WIDTH_FALLBACK_MIN", "30"))
+
+# NOAA SWPC Planetary K-index JSON
+NOAA_KP_JSON = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
 
 
 # -----------------------------
@@ -86,11 +74,8 @@ class TipSolution:
     msg_epoch: str
     decay_epoch: str
     rev: Optional[int]
-    direction: Optional[str]
     lat: Optional[float]
     lon: Optional[float]
-    incl: Optional[float]
-    high_interest: Optional[str]
     raw: dict
 
 
@@ -101,10 +86,11 @@ class TLEPoint:
     l1: str
     l2: str
     bstar: float
+    mean_motion_rev_per_day: float
 
 
 # -----------------------------
-# Helpers
+# Utils
 # -----------------------------
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -137,7 +123,7 @@ def parse_datetime_flexible(s: str) -> dt.datetime:
       - 'YYYY-MM-DDTHH:MM:SS'
       - 'YYYY-MM-DDTHH:MM:SS.ssssss'
       - with optional trailing Z
-    Returns timezone-aware UTC datetime.
+    Returns tz-aware UTC datetime.
     """
     if not s:
         raise ValueError("Empty datetime string")
@@ -145,9 +131,6 @@ def parse_datetime_flexible(s: str) -> dt.datetime:
     if s.endswith("Z"):
         s = s[:-1]
 
-    # Common Space-Track TIP format: "YYYY-MM-DD HH:MM:SS"
-    # But you encountered ISO with fractional seconds.
-    # Try a few.
     fmts = [
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
@@ -160,14 +143,11 @@ def parse_datetime_flexible(s: str) -> dt.datetime:
         except Exception:
             pass
 
-    # Last resort: fromisoformat
-    try:
-        x = dt.datetime.fromisoformat(s)
-        if x.tzinfo is None:
-            x = x.replace(tzinfo=dt.timezone.utc)
-        return x.astimezone(dt.timezone.utc)
-    except Exception as e:
-        raise ValueError(f"Unparsable datetime: {s}") from e
+    # ISO fallback
+    x = dt.datetime.fromisoformat(s)
+    if x.tzinfo is None:
+        x = x.replace(tzinfo=dt.timezone.utc)
+    return x.astimezone(dt.timezone.utc)
 
 def retry_get(session: requests.Session, url: str, tries: int = 6, timeout: int = 30) -> requests.Response:
     last_exc = None
@@ -186,7 +166,7 @@ def retry_get(session: requests.Session, url: str, tries: int = 6, timeout: int 
 
 def spacetrack_login(username: str, password: str) -> requests.Session:
     if not username or not password:
-        raise RuntimeError("Missing SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD (or GUI input).")
+        raise RuntimeError("Missing Space-Track username/password.")
     s = requests.Session()
     r = s.post(LOGIN_URL, data={"identity": username, "password": password}, timeout=30)
     r.raise_for_status()
@@ -205,42 +185,33 @@ def fetch_tip(session: requests.Session, norad_id: int, tip_url_override: str = 
     return r.json() if txt.startswith("[") else json.loads(txt)
 
 def parse_tip_solutions(tip_json: list) -> List[TipSolution]:
-    sols: List[TipSolution] = []
+    out: List[TipSolution] = []
     for row in tip_json:
-        sols.append(
+        out.append(
             TipSolution(
                 msg_epoch=(row.get("MSG_EPOCH") or "").strip(),
                 decay_epoch=(row.get("DECAY_EPOCH") or "").strip(),
                 rev=int(row["REV"]) if str(row.get("REV", "")).isdigit() else None,
-                direction=row.get("DIRECTION"),
                 lat=float(row["LAT"]) if row.get("LAT") not in (None, "") else None,
                 lon=float(row["LON"]) if row.get("LON") not in (None, "") else None,
-                incl=float(row["INCL"]) if row.get("INCL") not in (None, "") else None,
-                high_interest=row.get("HIGH_INTEREST"),
                 raw=row,
             )
         )
 
-    def key(sol: TipSolution):
-        try:
-            return parse_datetime_flexible(sol.msg_epoch).timestamp()
-        except Exception:
-            return 0.0
-
-    sols.sort(key=key, reverse=True)
-    return sols
+    out.sort(key=lambda s: parse_datetime_flexible(s.msg_epoch).timestamp() if s.msg_epoch else 0.0, reverse=True)
+    return out
 
 def select_latest_tip_batch(solutions: List[TipSolution]) -> List[TipSolution]:
     if not solutions:
         return []
-    newest_msg = solutions[0].msg_epoch
-    if not newest_msg:
+    newest = solutions[0].msg_epoch
+    if not newest:
         return solutions[:1]
-    return [s for s in solutions if s.msg_epoch == newest_msg]
+    return [s for s in solutions if s.msg_epoch == newest]
 
-def compute_tip_window_from_batch(solutions_latest_batch: List[TipSolution]) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], List[dt.datetime]]:
+def compute_tip_window(latest_batch: List[TipSolution]) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], List[dt.datetime]]:
     decays: List[dt.datetime] = []
-    for s in solutions_latest_batch:
+    for s in latest_batch:
         if s.decay_epoch:
             try:
                 decays.append(parse_datetime_flexible(s.decay_epoch))
@@ -250,12 +221,19 @@ def compute_tip_window_from_batch(solutions_latest_batch: List[TipSolution]) -> 
         return None, None, []
     return min(decays), max(decays), decays
 
+def normalize_tip_window(wmin: dt.datetime, wmax: dt.datetime) -> Tuple[dt.datetime, dt.datetime, str]:
+    width = (wmax - wmin).total_seconds()
+    if width >= 1.0:
+        return wmin, wmax, ""
+    pad = dt.timedelta(minutes=DEFAULT_ZERO_WIDTH_MINUTES)
+    return (wmin - pad), (wmax + pad), f"TIP window width was 0s; expanded to ±{DEFAULT_ZERO_WIDTH_MINUTES} min for sampling."
+
 def fetch_latest_tle(session: requests.Session, norad_id: int) -> Tuple[str, str, str]:
-    tle_url = (
+    url = (
         f"https://www.space-track.org/basicspacedata/query/class/gp/"
         f"NORAD_CAT_ID/{norad_id}/orderby/EPOCH%20desc/limit/1/format/tle"
     )
-    r = retry_get(session, tle_url)
+    r = retry_get(session, url)
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise RuntimeError("TLE fetch returned insufficient lines.")
@@ -265,9 +243,38 @@ def fetch_latest_tle(session: requests.Session, norad_id: int) -> Tuple[str, str
     else:
         if len(lines) < 3:
             raise RuntimeError("TLE fetch returned insufficient lines (expected name+2 lines).")
-        name = lines[0]
-        l1, l2 = lines[1], lines[2]
+        name, l1, l2 = lines[0], lines[1], lines[2]
     return name, l1, l2
+
+def parse_bstar_from_tle_line1(l1: str) -> float:
+    try:
+        s = l1[53:61].strip()
+        if len(s) < 7:
+            return float("nan")
+        mant = s[:-2]
+        exp = s[-2:]
+        sign = 1.0
+        if mant[0] == "-":
+            sign = -1.0
+            mant = mant[1:]
+        elif mant[0] == "+":
+            mant = mant[1:]
+        mantissa = sign * float(f"0.{mant}")
+        exponent = int(exp)
+        return mantissa * (10 ** exponent)
+    except Exception:
+        return float("nan")
+
+def parse_mean_motion_from_tle_line2(l2: str) -> float:
+    """
+    TLE line 2: mean motion is in columns 53-63 (1-indexed), approx slice [52:63] 0-indexed.
+    Example: " 15.12345678"
+    """
+    try:
+        s = l2[52:63].strip()
+        return float(s)
+    except Exception:
+        return float("nan")
 
 def fetch_tle_history(session: requests.Session, norad_id: int, limit: int = 25) -> List[TLEPoint]:
     url = (
@@ -292,52 +299,68 @@ def fetch_tle_history(session: requests.Session, norad_id: int, limit: int = 25)
         except Exception:
             continue
         bstar = parse_bstar_from_tle_line1(l1)
-        out.append(TLEPoint(epoch_utc=epoch_dt, name=name, l1=l1.strip(), l2=l2.strip(), bstar=bstar))
+        mm = parse_mean_motion_from_tle_line2(l2)
+        out.append(TLEPoint(epoch_utc=epoch_dt, name=name, l1=l1.strip(), l2=l2.strip(), bstar=bstar, mean_motion_rev_per_day=mm))
 
     out.sort(key=lambda x: x.epoch_utc)  # oldest -> newest
     return out
 
-def parse_bstar_from_tle_line1(l1: str) -> float:
-    """
-    Standard TLE B* format around columns 54-61 (8 chars) like ' 34123-4'
-    meaning +0.34123E-4.
-    """
-    try:
-        s = l1[53:61].strip()
-        if len(s) < 7:
-            return float("nan")
-        mant = s[:-2]
-        exp = s[-2:]
-        sign = 1.0
-        if mant[0] == "-":
-            sign = -1.0
-            mant = mant[1:]
-        elif mant[0] == "+":
-            mant = mant[1:]
-        mantissa = sign * float(f"0.{mant}")
-        exponent = int(exp)
-        return mantissa * (10 ** exponent)
-    except Exception:
-        return float("nan")
-
-def robust_bstar_stats(tles: List[TLEPoint]) -> Dict[str, float]:
-    vals = np.array([x.bstar for x in tles if np.isfinite(x.bstar)], dtype=float)
-    if len(vals) < 5:
-        return {"bstar_med": float("nan"), "bstar_mad": float("nan"), "bstar_trend_per_day": float("nan")}
-
+def robust_stats(vals: np.ndarray) -> Tuple[float, float]:
     med = float(np.median(vals))
     mad = float(np.median(np.abs(vals - med))) + 1e-30
+    return med, mad
 
+def compute_tle_trends(tles: List[TLEPoint]) -> Dict[str, float]:
+    """
+    Returns robust median/mad for B* and mean-motion, plus linear trend/day.
+    """
+    out: Dict[str, float] = {}
+    if len(tles) < 5:
+        return {
+            "bstar_med": float("nan"), "bstar_mad": float("nan"), "bstar_trend_per_day": float("nan"),
+            "mm_med": float("nan"), "mm_mad": float("nan"), "mm_trend_per_day": float("nan")
+        }
+
+    bvals = np.array([t.bstar for t in tles if np.isfinite(t.bstar)], dtype=float)
+    mvals = np.array([t.mean_motion_rev_per_day for t in tles if np.isfinite(t.mean_motion_rev_per_day)], dtype=float)
+
+    if len(bvals) >= 5:
+        bmed, bmad = robust_stats(bvals)
+    else:
+        bmed, bmad = float("nan"), float("nan")
+
+    if len(mvals) >= 5:
+        mmed, mmad = robust_stats(mvals)
+    else:
+        mmed, mmad = float("nan"), float("nan")
+
+    # Trend using last N
     n = min(15, len(tles))
     x0 = tles[-n].epoch_utc
     xs = np.array([(tles[-n+i].epoch_utc - x0).total_seconds() / 86400 for i in range(n)], dtype=float)
-    ys = np.array([tles[-n+i].bstar for i in range(n)], dtype=float)
-    try:
-        m = float(np.polyfit(xs, ys, 1)[0])
-    except Exception:
-        m = float("nan")
 
-    return {"bstar_med": med, "bstar_mad": mad, "bstar_trend_per_day": m}
+    # B* trend
+    btrend = float("nan")
+    try:
+        ys_b = np.array([tles[-n+i].bstar for i in range(n)], dtype=float)
+        if np.all(np.isfinite(ys_b)):
+            btrend = float(np.polyfit(xs, ys_b, 1)[0])
+    except Exception:
+        pass
+
+    # Mean motion trend (rev/day per day)
+    mmtrend = float("nan")
+    try:
+        ys_m = np.array([tles[-n+i].mean_motion_rev_per_day for i in range(n)], dtype=float)
+        if np.all(np.isfinite(ys_m)):
+            mmtrend = float(np.polyfit(xs, ys_m, 1)[0])
+    except Exception:
+        pass
+
+    return {
+        "bstar_med": bmed, "bstar_mad": bmad, "bstar_trend_per_day": btrend,
+        "mm_med": mmed, "mm_mad": mmad, "mm_trend_per_day": mmtrend
+    }
 
 def split_dateline_segments(lats: List[float], lons: List[float], jump_deg: float = 180.0):
     if not lats or not lons or len(lats) != len(lons):
@@ -393,115 +416,117 @@ def subpoint_at_time(sat: EarthSatellite, t_utc: dt.datetime) -> Tuple[float, fl
 
 
 # -----------------------------
-# NOAA Kp
+# NOAA Kp (nearest-time)
 # -----------------------------
-def fetch_noaa_kp_json() -> list:
-    # No session needed (public)
-    r = requests.get(NOAA_KP_JSON_PRIMARY, timeout=20)
+def fetch_noaa_kp_rows() -> list:
+    r = requests.get(NOAA_KP_JSON, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def kp_max_last_24h(kp_rows: list, ref_utc: dt.datetime) -> float:
+def kp_nearest(kp_rows: list, target_utc: dt.datetime, max_age_hours: int = 72) -> float:
     """
-    NOAA Kp JSON is typically a table-like list where first row is header.
-    We'll parse rows that look like:
-      ["time_tag","kp_index",...]
-    and filter last 24 hours from ref_utc.
+    Returns kp_index nearest to target_utc (within +-max_age_hours).
+    NOAA file is usually header row + rows: [time_tag, kp_index, ...]
     """
     if not isinstance(kp_rows, list) or len(kp_rows) < 2:
         return float("nan")
 
     header = kp_rows[0]
-    # Expected columns: time_tag, kp_index
     try:
-        time_idx = header.index("time_tag")
-        kp_idx = header.index("kp_index")
+        t_idx = header.index("time_tag")
+        k_idx = header.index("kp_index")
     except Exception:
-        # Some variants use different header naming; try fallbacks
-        time_idx = 0
-        kp_idx = 1
+        t_idx, k_idx = 0, 1
 
-    lo = ref_utc - dt.timedelta(hours=24)
-    best = float("-inf")
-    found = False
+    best_dt = None
+    best_kp = float("nan")
+    best_abs = None
+
+    lo = target_utc - dt.timedelta(hours=max_age_hours)
+    hi = target_utc + dt.timedelta(hours=max_age_hours)
 
     for row in kp_rows[1:]:
-        if not isinstance(row, list) or len(row) <= max(time_idx, kp_idx):
+        if not isinstance(row, list) or len(row) <= max(t_idx, k_idx):
             continue
         try:
-            t = parse_datetime_flexible(str(row[time_idx]))
-            kp = float(row[kp_idx])
+            t = parse_datetime_flexible(str(row[t_idx]))
+            kp = float(row[k_idx])
         except Exception:
             continue
-        if lo <= t <= ref_utc:
-            found = True
-            if kp > best:
-                best = kp
+        if not (lo <= t <= hi):
+            continue
+        d = abs((t - target_utc).total_seconds())
+        if best_abs is None or d < best_abs:
+            best_abs = d
+            best_dt = t
+            best_kp = kp
 
-    return float(best) if found else float("nan")
+    return float(best_kp) if best_dt else float("nan")
 
 
 # -----------------------------
-# Prediction model (MC inside TIP window)
+# MC Sampling: combine Kp + mean-motion trend + (optional) B*
 # -----------------------------
-def mc_sample_time_inside_window(
+def mc_sample_time(
     wmin: dt.datetime,
     wmax: dt.datetime,
+    mc_n: int,
     use_bstar: bool,
-    bstar_stats: Dict[str, float],
-    kp_value: float,
-    n: int = 2000,
-    seed: Optional[int] = None
+    trends: Dict[str, float],
+    kp_at_target: float
 ) -> np.ndarray:
     """
-    Samples reentry time INSIDE [wmin, wmax] using a beta distribution.
+    Samples time inside window using Beta distribution.
 
-    Bias is derived from:
-      - Sequential TLE B* (drag proxy): higher + rising -> earlier
-      - Kp (geomagnetic activity proxy): higher -> earlier (more drag)
+    Bias drivers:
+      - Kp: higher => earlier
+      - Mean motion trend: more negative/decay signals earlier (proxy)
+      - B* trend/level (optional): higher => earlier
+
+    IMPORTANT: This does NOT create new physics. It's a bias/uncertainty model.
     """
-    if seed is not None:
-        np.random.seed(seed)
-
     width_s = max(1.0, (wmax - wmin).total_seconds())
 
-    # Base mean at 0.5 (mid-window)
+    # base mean at midpoint
     mean = 0.5
 
-    # --- Kp bias ---
-    # Kp ranges 0-9. We'll map to a conservative shift up to ~±0.20 of the window.
-    if np.isfinite(kp_value):
-        # higher kp -> earlier => mean moves toward 0
-        mean += float(np.clip(-(kp_value - 3.0) * 0.03, -0.20, 0.10))
+    # Kp -> bias (conservative but stronger than previous)
+    # Typical Kp around 1-4. Strong storms 6-9.
+    if np.isfinite(kp_at_target):
+        # shift up to about -0.30 (earlier) for very high Kp
+        mean += float(np.clip(-(kp_at_target - 2.5) * 0.05, -0.30, 0.15))
 
-    # --- B* bias ---
+    # Mean motion trend bias:
+    # If mean motion is increasing (often as orbit decays, mean motion increases),
+    # stronger increase => earlier.
+    mmtrend = trends.get("mm_trend_per_day", float("nan"))
+    if np.isfinite(mmtrend):
+        # Scale: typical changes are small; amplify with tanh
+        mean += float(np.clip(-0.18 * np.tanh(mmtrend * 200.0), -0.18, 0.18))
+
+    # B* bias (optional)
     if use_bstar:
-        med = bstar_stats.get("bstar_med", float("nan"))
-        mad = bstar_stats.get("bstar_mad", float("nan"))
-        trend = bstar_stats.get("bstar_trend_per_day", float("nan"))
+        bmed = trends.get("bstar_med", float("nan"))
+        btrend = trends.get("bstar_trend_per_day", float("nan"))
+        if np.isfinite(bmed):
+            mean += float(np.clip(-0.10 * np.tanh(math.log10(abs(bmed) + 1e-15) + 7.0), -0.12, 0.12))
+        if np.isfinite(btrend):
+            mean += float(np.clip(-0.12 * np.tanh(btrend * 5e4), -0.12, 0.12))
 
-        if np.isfinite(med):
-            # log magnitude proxy; higher magnitude -> earlier
-            mean += float(np.clip(-0.06 * np.tanh(math.log10(abs(med) + 1e-15) + 7.0), -0.12, 0.12))
-        if np.isfinite(trend):
-            # increasing trend -> earlier
-            mean += float(np.clip(-0.08 * np.tanh(trend * 5e4), -0.12, 0.12))
+    mean = float(np.clip(mean, 0.03, 0.97))
 
-        # Spread control: more uncertainty (high MAD) -> flatter
-        flatness = 0.55
-        if np.isfinite(mad) and np.isfinite(med) and abs(med) > 0:
-            rel = mad / (abs(med) + 1e-30)
-            flatness = float(np.clip(0.35 + 2.0 * rel, 0.35, 0.95))
-        k = (1.0 - flatness) * 18.0 + 2.0
-    else:
-        # Without bstar, keep a moderate concentration
-        k = 10.0
+    # Concentration: use combined uncertainty from mm_mad and bstar_mad
+    k = 10.0
+    mm_med = trends.get("mm_med", float("nan"))
+    mm_mad = trends.get("mm_mad", float("nan"))
+    if np.isfinite(mm_med) and np.isfinite(mm_mad) and abs(mm_med) > 0:
+        rel = mm_mad / (abs(mm_med) + 1e-30)
+        # higher rel => flatter => smaller k
+        k = float(np.clip(14.0 / (1.0 + 8.0 * rel), 3.0, 18.0))
 
-    mean = float(np.clip(mean, 0.05, 0.95))
     a = mean * k
     b = (1.0 - mean) * k
-
-    u = np.random.beta(a, b, size=int(n))
+    u = np.random.beta(a, b, size=int(mc_n))
     ts = np.array([wmin.timestamp() + float(x) * width_s for x in u], dtype=float)
     return ts
 
@@ -509,74 +534,48 @@ def mc_sample_time_inside_window(
 # -----------------------------
 # KML helpers
 # -----------------------------
-def _kml_color(aabbggrr: str) -> str:
-    # simplekml expects aabbggrr; caller provides it.
-    return aabbggrr
-
-def export_kml_tracks_and_points(
-    kml_path: str,
-    tracks: List[Dict[str, Any]],
-    points: List[Dict[str, Any]],
-    swath_polygon: Optional[List[Tuple[float, float]]] = None
-) -> None:
+def export_kml(path: str, tracks: List[Dict[str, Any]], points: List[Dict[str, Any]], swath_poly: Optional[List[Tuple[float, float]]] = None) -> None:
     if simplekml is None:
         raise RuntimeError("simplekml not installed. pip install simplekml")
-
     kml = simplekml.Kml()
 
-    # Tracks
     for tr in tracks:
         ls = kml.newlinestring(name=tr["name"])
         ls.coords = list(zip(tr["lons"], tr["lats"]))
         ls.altitudemode = simplekml.AltitudeMode.clamptoground
         ls.extrude = 0
         if "color" in tr:
-            ls.style.linestyle.color = _kml_color(tr["color"])
+            ls.style.linestyle.color = tr["color"]  # aabbggrr
         if "width" in tr:
             ls.style.linestyle.width = int(tr["width"])
 
-    # Points
     for p in points:
         pt = kml.newpoint(name=p["name"], coords=[(p["lon"], p["lat"])])
         if "description" in p:
             pt.description = p["description"]
-        if "icon_href" in p:
-            pt.style.iconstyle.icon.href = p["icon_href"]
 
-    # Swath polygon (optional)
-    if swath_polygon:
-        pol = kml.newpolygon(name="Reentry Swath (± km)")
-        pol.outerboundaryis = [(lon, lat) for (lon, lat) in swath_polygon]
-        pol.style.polystyle.fill = 0  # outline only
+    if swath_poly:
+        pol = kml.newpolygon(name="Swath (±km)")
+        pol.outerboundaryis = [(lon, lat) for (lon, lat) in swath_poly]
+        pol.style.polystyle.fill = 0
         pol.style.linestyle.width = 2
 
-    kml.save(kml_path)
+    kml.save(path)
 
 def build_simple_swath_polygon(lats: List[float], lons: List[float], half_width_km: float) -> List[Tuple[float, float]]:
-    """
-    Builds a crude buffer polygon around a linestring by offsetting left/right in lat/lon degrees.
-
-    This is an approximation suitable for quick GIS overlays.
-    For better accuracy, you'd buffer in a projected CRS (e.g., EPSG:3857/3395) using shapely+pyproj.
-    """
     if not lats or not lons or len(lats) < 2:
         return []
 
-    # Convert km to degrees scale
-    # 1 deg lat ~ 111 km; 1 deg lon ~ 111*cos(lat) km
     left = []
     right = []
-
     for i in range(len(lats)):
         lat = lats[i]
         lon = lons[i]
-
-        # local heading using neighbor
         j0 = max(0, i - 1)
         j1 = min(len(lats) - 1, i + 1)
         dlat = lats[j1] - lats[j0]
         dlon = lons[j1] - lons[j0]
-        # normal vector (perpendicular)
+
         nx, ny = -dlat, dlon
         norm = math.hypot(nx, ny) + 1e-12
         nx /= norm
@@ -588,35 +587,8 @@ def build_simple_swath_polygon(lats: List[float], lons: List[float], half_width_
         left.append(( ((lon + dlon_deg + 180) % 360) - 180, lat + dlat_deg ))
         right.append(( ((lon - dlon_deg + 180) % 360) - 180, lat - dlat_deg ))
 
-    # polygon: left forward + right reversed + close
     poly = left + right[::-1] + [left[0]]
     return [(lon, lat) for (lon, lat) in poly]
-
-
-# -----------------------------
-# History CSV
-# -----------------------------
-def history_path(out_dir: str, norad_id: int) -> str:
-    return os.path.join(out_dir, f"tip_history_{norad_id}.csv")
-
-def read_last_history_row(csv_path: str) -> Optional[dict]:
-    if not os.path.exists(csv_path):
-        return None
-    try:
-        with open(csv_path, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        return rows[-1] if rows else None
-    except Exception:
-        return None
-
-def append_history_row(csv_path: str, row: dict) -> None:
-    file_exists = os.path.exists(csv_path)
-    fieldnames = list(row.keys())
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            w.writeheader()
-        w.writerow(row)
 
 
 # -----------------------------
@@ -625,7 +597,7 @@ def append_history_row(csv_path: str, row: dict) -> None:
 class ReentryGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Reentry Monitor (TIP + TLE) — Latest TIP Only + Map Envelope (Kp Prediction + KML)")
+        self.title("Reentry Monitor (TIP + TLE) — Latest TIP Only + Map Envelope (Refined Prediction + KML)")
         self.geometry("1240x820")
 
         self.out_dir = os.getenv("OUT_DIR", "./reentry_out")
@@ -633,21 +605,23 @@ class ReentryGUI(tk.Tk):
 
         # State
         self.tip_raw: Optional[list] = None
-        self.solutions_all: List[TipSolution] = []
-        self.solutions_latest: List[TipSolution] = []
-        self.tle: Optional[Tuple[str, str, str]] = None
-        self.tle_hist: List[TLEPoint] = []
-        self.bstar_stats: Dict[str, float] = {}
+        self.sol_all: List[TipSolution] = []
+        self.sol_latest: List[TipSolution] = []
 
         self.window_min: Optional[dt.datetime] = None
         self.window_max: Optional[dt.datetime] = None
+        self.window_center: Optional[dt.datetime] = None
 
-        self.latest_sat: Optional[EarthSatellite] = None
+        self.tle_latest: Optional[Tuple[str, str, str]] = None
+        self.tle_hist: List[TLEPoint] = []
+        self.trends: Dict[str, float] = {}
 
-        # Prediction results
+        self.sat: Optional[EarthSatellite] = None
+
         self.pred: Dict[str, Any] = {}
+        self.last_kp: Optional[float] = None
 
-        # UI vars (match your GUI style)
+        # UI vars (kept in the same style as your GUI)
         self.var_user = tk.StringVar(value=os.getenv("SPACE_TRACK_USERNAME", ""))
         self.var_pass = tk.StringVar(value=os.getenv("SPACE_TRACK_PASSWORD", ""))
         self.var_norad = tk.StringVar(value=os.getenv("NORAD_CAT_ID", "66877"))
@@ -657,13 +631,14 @@ class ReentryGUI(tk.Tk):
         self.var_after = tk.StringVar(value="90")
         self.var_step = tk.StringVar(value="30")
         self.var_mid_tracks = tk.StringVar(value="5")
-
         self.var_ph_focus = tk.BooleanVar(value=False)
 
-        # Prediction knobs shown in your screenshot
         self.var_mc_samples = tk.StringVar(value="2000")
         self.var_swath_km = tk.StringVar(value="100")
         self.var_use_bstar = tk.BooleanVar(value=True)
+
+        # BIG refinement switch
+        self.var_use_tip_latlon = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._build_plot()
@@ -703,7 +678,9 @@ class ReentryGUI(tk.Tk):
 
         add_field("MC samples", self.var_mc_samples, 8)
         add_field("Swath ±km (KML)", self.var_swath_km, 10)
+
         ttk.Checkbutton(row3, text="Use sequential TLE B* bias", variable=self.var_use_bstar).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(row3, text="Use TIP LAT/LON for point (recommended)", variable=self.var_use_tip_latlon).pack(side=tk.LEFT, padx=(12, 0))
 
         btns = ttk.Frame(self, padding=(10, 0, 10, 10))
         btns.pack(side=tk.TOP, fill=tk.X)
@@ -769,84 +746,58 @@ class ReentryGUI(tk.Tk):
 
     def _plot_track(self, lats: List[float], lons: List[float], linewidth: float, alpha: float, linestyle: str = "-"):
         for seg_lat, seg_lon in split_dateline_segments(lats, lons):
-            self.ax.plot(seg_lon, seg_lat, transform=ccrs.PlateCarree(),
-                         linewidth=linewidth, alpha=alpha, linestyle=linestyle)
-
-    def _normalize_tip_window(self, wmin: dt.datetime, wmax: dt.datetime) -> Tuple[dt.datetime, dt.datetime, str]:
-        """
-        If wmin==wmax (0 width), expand around the single epoch.
-        """
-        width = (wmax - wmin).total_seconds()
-        if width >= 1.0:
-            return wmin, wmax, ""
-        pad = dt.timedelta(minutes=DEFAULT_ZERO_WIDTH_MINUTES)
-        return (wmin - pad), (wmax + pad), f"TIP window width was 0s; expanded to ±{DEFAULT_ZERO_WIDTH_MINUTES} min."
+            self.ax.plot(seg_lon, seg_lat, transform=ccrs.PlateCarree(), linewidth=linewidth, alpha=alpha, linestyle=linestyle)
 
     def on_fetch(self):
         try:
             user = self.var_user.get().strip()
             pw = self.var_pass.get().strip()
             norad = self._get_int(self.var_norad, "NORAD_CAT_ID")
-            tip_url_override = self.var_tip_url.get().strip()
+            tip_url = self.var_tip_url.get().strip()
 
             self._log("Logging in to Space-Track…")
             session = spacetrack_login(user, pw)
 
             self._log(f"Fetching TIP (limit={DEFAULT_TIP_LIMIT})…")
-            self.tip_raw = fetch_tip(session, norad, tip_url_override, limit=DEFAULT_TIP_LIMIT)
-            self.solutions_all = parse_tip_solutions(self.tip_raw)
-            self.solutions_latest = select_latest_tip_batch(self.solutions_all)
+            self.tip_raw = fetch_tip(session, norad, tip_url, limit=DEFAULT_TIP_LIMIT)
+            self.sol_all = parse_tip_solutions(self.tip_raw)
+            self.sol_latest = select_latest_tip_batch(self.sol_all)
 
-            self._log("Fetching latest TLE…")
-            self.tle = fetch_latest_tle(session, norad)
+            if not self.sol_latest:
+                raise RuntimeError("No TIP solutions returned.")
 
-            # sequential TLEs for B* (optional)
-            self.tle_hist = fetch_tle_history(session, norad, limit=25)
-            self.bstar_stats = robust_bstar_stats(self.tle_hist) if self.tle_hist else {"bstar_med": float("nan"), "bstar_mad": float("nan"), "bstar_trend_per_day": float("nan")}
-
-            wmin, wmax, decays = compute_tip_window_from_batch(self.solutions_latest)
-            if not (wmin and wmax):
+            wmin0, wmax0, _ = compute_tip_window(self.sol_latest)
+            if not (wmin0 and wmax0):
                 raise RuntimeError("Latest TIP batch has no usable DECAY_EPOCH values.")
 
-            wmin2, wmax2, note = self._normalize_tip_window(wmin, wmax)
-            self.window_min, self.window_max = wmin2, wmax2
+            # center is true center of *original* window (even if zero width)
+            self.window_center = wmin0 + (wmax0 - wmin0) / 2
 
-            name, l1, l2 = self.tle
-            ts = sf_load.timescale()
-            self.latest_sat = EarthSatellite(l1, l2, name, ts)
+            wmin, wmax, note = normalize_tip_window(wmin0, wmax0)
+            self.window_min, self.window_max = wmin, wmax
 
-            latest_msg_epoch = self.solutions_latest[0].msg_epoch if self.solutions_latest else ""
-            width = (self.window_max - self.window_min)
-
-            self._log(f"Latest TIP MSG_EPOCH used: {latest_msg_epoch} (batch rows: {len(self.solutions_latest)})")
-            self._log(f"Decay window: {dt_to_iso_z(self.window_min)} to {dt_to_iso_z(self.window_max)} (width {fmt_timedelta(width)})")
+            latest_msg = self.sol_latest[0].msg_epoch
+            self._log(f"Latest TIP MSG_EPOCH used: {latest_msg} (batch rows: {len(self.sol_latest)})")
+            self._log(f"Decay window: {dt_to_iso_z(self.window_min)} to {dt_to_iso_z(self.window_max)} (width {fmt_timedelta(self.window_max - self.window_min)})")
             if note:
                 self._log(f"NOTE: {note}")
 
+            self._log("Fetching latest TLE…")
+            self.tle_latest = fetch_latest_tle(session, norad)
+            name, l1, l2 = self.tle_latest
+            ts = sf_load.timescale()
+            self.sat = EarthSatellite(l1, l2, name, ts)
+
+            self._log("Fetching TLE history…")
+            self.tle_hist = fetch_tle_history(session, norad, limit=25)
+            self.trends = compute_tle_trends(self.tle_hist) if self.tle_hist else {}
             if self.tle_hist:
                 self._log(
                     f"TLE hist loaded: {len(self.tle_hist)} | "
-                    f"B* median={self.bstar_stats.get('bstar_med', float('nan')):.3e} "
-                    f"MAD={self.bstar_stats.get('bstar_mad', float('nan')):.3e} "
-                    f"trend/day={self.bstar_stats.get('bstar_trend_per_day', float('nan')):.3e}"
+                    f"MM med={self.trends.get('mm_med', float('nan')):.6f} rev/day "
+                    f"trend/day={self.trends.get('mm_trend_per_day', float('nan')):.6e} | "
+                    f"B* med={self.trends.get('bstar_med', float('nan')):.3e}"
                 )
-
-            # history log
-            hist_csv = history_path(self.out_dir, norad)
-            now_utc = dt.datetime.now(dt.timezone.utc)
-            row = {
-                "run_utc": dt_to_iso_z(now_utc),
-                "norad_id": str(norad),
-                "tip_msg_epoch_used": latest_msg_epoch,
-                "latest_batch_count": str(len(self.solutions_latest)),
-                "window_start_utc": dt_to_iso_z(self.window_min),
-                "window_end_utc": dt_to_iso_z(self.window_max),
-                "window_width_sec": str(int((self.window_max - self.window_min).total_seconds())),
-                "tip_total_rows_fetched": str(len(self.solutions_all)),
-                "tip_limit": str(DEFAULT_TIP_LIMIT),
-            }
-            append_history_row(hist_csv, row)
-            self._log(f"Saved history: {hist_csv}")
 
         except Exception as e:
             messagebox.showerror("Fetch error", str(e))
@@ -854,7 +805,7 @@ class ReentryGUI(tk.Tk):
 
     def on_plot_envelope(self):
         try:
-            if not (self.latest_sat and self.window_min and self.window_max):
+            if not (self.sat and self.window_min and self.window_max):
                 raise RuntimeError("Fetch TIP + TLE first.")
 
             before_min = self._get_int(self.var_before, "Window Before (min)")
@@ -865,115 +816,141 @@ class ReentryGUI(tk.Tk):
             wmin = self.window_min
             wmax = self.window_max
             width = wmax - wmin
-            wmid = wmin + dt.timedelta(seconds=width.total_seconds() / 2)
 
-            latest_msg_epoch = self.solutions_latest[0].msg_epoch if self.solutions_latest else ""
+            latest_msg = self.sol_latest[0].msg_epoch if self.sol_latest else ""
 
             self._setup_map()
 
-            # faint intermediate tracks
             if mid_tracks > 0 and width.total_seconds() > 0:
                 for i in range(1, mid_tracks + 1):
                     frac = i / (mid_tracks + 1)
                     t_i = wmin + dt.timedelta(seconds=width.total_seconds() * frac)
-                    lats_i, lons_i, _ = groundtrack_corridor(self.latest_sat, t_i, before_min, after_min, step_s)
+                    lats_i, lons_i, _ = groundtrack_corridor(self.sat, t_i, before_min, after_min, step_s)
                     self._plot_track(lats_i, lons_i, linewidth=0.9, alpha=0.22, linestyle="--")
 
-            # min/max boundaries (green like your screenshot)
-            lats_min, lons_min, _ = groundtrack_corridor(self.latest_sat, wmin, before_min, after_min, step_s)
-            lats_max, lons_max, _ = groundtrack_corridor(self.latest_sat, wmax, before_min, after_min, step_s)
-            self._plot_track(lats_min, lons_min, linewidth=2.0, alpha=0.90, linestyle="-")
-            self._plot_track(lats_max, lons_max, linewidth=2.0, alpha=0.90, linestyle="-")
+            lats_min, lons_min, _ = groundtrack_corridor(self.sat, wmin, before_min, after_min, step_s)
+            lats_max, lons_max, _ = groundtrack_corridor(self.sat, wmax, before_min, after_min, step_s)
+            self._plot_track(lats_min, lons_min, linewidth=2.0, alpha=0.90)
+            self._plot_track(lats_max, lons_max, linewidth=2.0, alpha=0.90)
 
             self.ax.set_title(
-                f"{self.latest_sat.name} — Latest TIP MSG_EPOCH: {latest_msg_epoch}\n"
+                f"{self.sat.name} — Latest TIP MSG_EPOCH: {latest_msg}\n"
                 f"Decay window: {dt_to_iso_z(wmin)} to {dt_to_iso_z(wmax)} (width {fmt_timedelta(width)})"
             )
             self.canvas.draw()
-            self._log("Envelope plotted (latest TIP only): min/max boundaries + intermediate tracks.")
+            self._log("Envelope plotted (latest TIP only).")
 
         except Exception as e:
             messagebox.showerror("Plot error", str(e))
             self._log(f"ERROR: {e}")
 
+    def _tip_point_for_time(self, t_utc: dt.datetime) -> Optional[Tuple[float, float, str]]:
+        """
+        If TIP LAT/LON exists, choose the TIP solution whose DECAY_EPOCH is closest to t_utc.
+        Returns (lat, lon, source_note) or None.
+        """
+        if not self.sol_latest:
+            return None
+
+        best = None
+        best_abs = None
+        for s in self.sol_latest:
+            if s.lat is None or s.lon is None or not s.decay_epoch:
+                continue
+            try:
+                td = abs((parse_datetime_flexible(s.decay_epoch) - t_utc).total_seconds())
+            except Exception:
+                continue
+            if best_abs is None or td < best_abs:
+                best_abs = td
+                best = s
+
+        if best is None:
+            return None
+
+        lon = ((best.lon + 180) % 360) - 180
+        return float(best.lat), float(lon), "TIP_LATLON_nearest_DECAY_EPOCH"
+
     def on_run_prediction(self):
         try:
-            if not (self.latest_sat and self.window_min and self.window_max):
+            if not (self.sat and self.window_min and self.window_max):
                 raise RuntimeError("Fetch TIP + TLE first.")
 
             wmin = self.window_min
             wmax = self.window_max
             width_s = (wmax - wmin).total_seconds()
             if width_s < 1.0:
-                raise RuntimeError("Invalid TIP window width (still too small after fallback).")
+                raise RuntimeError("TIP window still too small after fallback.")
 
             mc_n = max(200, min(20000, self._get_int(self.var_mc_samples, "MC samples")))
             use_bstar = bool(self.var_use_bstar.get())
+            use_tip_latlon = bool(self.var_use_tip_latlon.get())
 
-            # NOAA Kp around the latest TLE epoch (best we can do operationally)
+            # choose a target epoch for Kp-nearest: use the TRUE center of original window if available
+            t_target = self.window_center or (wmin + (wmax - wmin) / 2)
+
+            self._log("Fetching NOAA Kp…")
             kp_val = float("nan")
-            if self.tle_hist:
-                ref = self.tle_hist[-1].epoch_utc
-            else:
-                ref = dt.datetime.now(dt.timezone.utc)
-
-            self._log("Fetching NOAA Kp (last 24h max)…")
             try:
-                kp_rows = fetch_noaa_kp_json()
-                kp_val = kp_max_last_24h(kp_rows, ref)
+                kp_rows = fetch_noaa_kp_rows()
+                kp_val = kp_nearest(kp_rows, t_target)
             except Exception as e:
-                kp_val = float("nan")
                 self._log(f"WARNING: NOAA Kp fetch failed ({e}). Continuing without Kp bias.")
 
+            self.last_kp = kp_val if np.isfinite(kp_val) else None
             if np.isfinite(kp_val):
-                self._log(f"NOAA Kp max last 24h (ref={dt_to_iso_z(ref)}): {kp_val:.1f}")
+                self._log(f"Kp nearest {dt_to_iso_z(t_target)}: {kp_val:.1f}")
             else:
-                self._log("NOAA Kp: unavailable (no bias applied).")
+                self._log("Kp: unavailable (no bias applied).")
 
-            # Monte Carlo time sampling inside the TIP window
-            ts_samples = mc_sample_time_inside_window(
-                wmin, wmax,
-                use_bstar=use_bstar,
-                bstar_stats=self.bstar_stats,
-                kp_value=kp_val,
-                n=mc_n
-            )
+            # Monte Carlo sample time inside window
+            ts_samples = mc_sample_time(wmin, wmax, mc_n, use_bstar, self.trends, kp_val)
 
-            # percentiles
-            p10 = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 10)), tz=dt.timezone.utc)
-            p50 = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 50)), tz=dt.timezone.utc)
-            p90 = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 90)), tz=dt.timezone.utc)
+            p10_t = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 10)), tz=dt.timezone.utc)
+            p50_t = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 50)), tz=dt.timezone.utc)
+            p90_t = dt.datetime.fromtimestamp(float(np.percentile(ts_samples, 90)), tz=dt.timezone.utc)
 
-            lat10, lon10 = subpoint_at_time(self.latest_sat, p10)
-            lat50, lon50 = subpoint_at_time(self.latest_sat, p50)
-            lat90, lon90 = subpoint_at_time(self.latest_sat, p90)
+            def get_point(t: dt.datetime) -> Tuple[float, float, str]:
+                if use_tip_latlon:
+                    tippt = self._tip_point_for_time(t)
+                    if tippt:
+                        lat, lon, src = tippt
+                        return lat, lon, src
+                lat, lon = subpoint_at_time(self.sat, t)
+                return lat, lon, "TLE_subpoint"
 
-            # store prediction
+            p10_lat, p10_lon, p10_src = get_point(p10_t)
+            p50_lat, p50_lon, p50_src = get_point(p50_t)
+            p90_lat, p90_lon, p90_src = get_point(p90_t)
+
             self.pred = {
                 "generated_utc": dt_to_iso_z(dt.datetime.now(dt.timezone.utc)),
                 "norad_id": int(self.var_norad.get().strip()),
+                "tip_msg_epoch": self.sol_latest[0].msg_epoch if self.sol_latest else None,
                 "tip_window": {"start_utc": dt_to_iso_z(wmin), "end_utc": dt_to_iso_z(wmax), "width_sec": int(width_s)},
-                "kp_max_last_24h": kp_val if np.isfinite(kp_val) else None,
-                "use_bstar_bias": bool(use_bstar),
-                "bstar_stats": self.bstar_stats if use_bstar else None,
+                "kp_nearest_time": dt_to_iso_z(t_target),
+                "kp_value": float(kp_val) if np.isfinite(kp_val) else None,
+                "use_bstar_bias": use_bstar,
+                "use_tip_latlon": use_tip_latlon,
+                "tle_trends": self.trends,
                 "mc_samples": int(mc_n),
-                "p10": {"t_utc": dt_to_iso_z(p10), "lat": lat10, "lon": lon10},
-                "p50": {"t_utc": dt_to_iso_z(p50), "lat": lat50, "lon": lon50},
-                "p90": {"t_utc": dt_to_iso_z(p90), "lat": lat90, "lon": lon90},
+                "p10": {"t_utc": dt_to_iso_z(p10_t), "lat": p10_lat, "lon": p10_lon, "point_source": p10_src},
+                "p50": {"t_utc": dt_to_iso_z(p50_t), "lat": p50_lat, "lon": p50_lon, "point_source": p50_src},
+                "p90": {"t_utc": dt_to_iso_z(p90_t), "lat": p90_lat, "lon": p90_lon, "point_source": p90_src},
             }
 
-            # plot: corridor + predicted points (P50 as “red dot” equivalent)
+            # Plot envelope + points
             self.on_plot_envelope()
-            self.ax.plot([lon50], [lat50], marker="o", markersize=8, transform=ccrs.PlateCarree())
-            self.ax.plot([lon10], [lat10], marker="o", markersize=6, transform=ccrs.PlateCarree())
-            self.ax.plot([lon90], [lat90], marker="o", markersize=6, transform=ccrs.PlateCarree())
-            self.ax.text(lon50 + 2, lat50 + 2, "P50 (best est.)", transform=ccrs.PlateCarree(), fontsize=9)
-            self.ax.text(lon10 + 2, lat10 - 2, "P10", transform=ccrs.PlateCarree(), fontsize=9)
-            self.ax.text(lon90 + 2, lat90 - 2, "P90", transform=ccrs.PlateCarree(), fontsize=9)
+            self.ax.plot([p50_lon], [p50_lat], marker="o", markersize=9, transform=ccrs.PlateCarree())
+            self.ax.plot([p10_lon], [p10_lat], marker="o", markersize=6, transform=ccrs.PlateCarree())
+            self.ax.plot([p90_lon], [p90_lat], marker="o", markersize=6, transform=ccrs.PlateCarree())
+            self.ax.text(p50_lon + 2, p50_lat + 2, f"P50 ({p50_src})", transform=ccrs.PlateCarree(), fontsize=9)
+            self.ax.text(p10_lon + 2, p10_lat - 2, "P10", transform=ccrs.PlateCarree(), fontsize=9)
+            self.ax.text(p90_lon + 2, p90_lat - 2, "P90", transform=ccrs.PlateCarree(), fontsize=9)
             self.canvas.draw()
 
-            self._log(f"P50 predicted time: {dt_to_iso_z(p50)} | {dt_to_iso_ph(p50)}")
-            self._log(f"P50 predicted point: lat={lat50:.2f}, lon={lon50:.2f}")
+            self._log(f"P50 time: {self.pred['p50']['t_utc']} | {dt_to_iso_ph(p50_t)}")
+            self._log(f"P50 point: lat={p50_lat:.2f}, lon={p50_lon:.2f} (source={p50_src})")
 
         except Exception as e:
             messagebox.showerror("Prediction error", str(e))
@@ -981,12 +958,12 @@ class ReentryGUI(tk.Tk):
 
     def on_export_kml(self):
         try:
-            if not (self.latest_sat and self.window_min and self.window_max):
-                raise RuntimeError("Fetch TIP + TLE first.")
-            if not self.pred:
-                raise RuntimeError("Run Kp-Based Prediction first.")
             if simplekml is None:
                 raise RuntimeError("simplekml not installed. pip install simplekml")
+            if not (self.sat and self.window_min and self.window_max):
+                raise RuntimeError("Fetch TIP + TLE first.")
+            if not self.pred:
+                raise RuntimeError("Run prediction first.")
 
             folder = filedialog.askdirectory(title="Select folder to save KML")
             if not folder:
@@ -1002,36 +979,33 @@ class ReentryGUI(tk.Tk):
 
             wmin = self.window_min
             wmax = self.window_max
-            p50 = parse_datetime_flexible(self.pred["p50"]["t_utc"])
+            p50_t = parse_datetime_flexible(self.pred["p50"]["t_utc"])
 
-            # tracks
             tracks = []
             for nm, tt, color, width in [
                 ("TIP_min", wmin, "ff00ff00", 3),  # green
                 ("TIP_max", wmax, "ff00ff00", 3),  # green
-                ("P50_track", p50, "ff00a0ff", 4),  # orange-ish in KML ABGR
+                ("P50_track", p50_t, "ff00a0ff", 4),  # orange-ish
             ]:
-                lats, lons, _ = groundtrack_corridor(self.latest_sat, tt, before_min, after_min, step_s)
+                lats, lons, _ = groundtrack_corridor(self.sat, tt, before_min, after_min, step_s)
                 tracks.append({"name": nm, "lats": lats, "lons": lons, "color": color, "width": width})
 
-            # swath polygon around P50 track (optional)
             swath_poly = None
             if swath_km > 0.0:
-                lats50, lons50, _ = groundtrack_corridor(self.latest_sat, p50, before_min, after_min, step_s)
+                lats50, lons50, _ = groundtrack_corridor(self.sat, p50_t, before_min, after_min, step_s)
                 swath_poly = build_simple_swath_polygon(lats50, lons50, swath_km)
 
-            # points
-            pts = []
+            points = []
             for tag in ["p10", "p50", "p90"]:
-                pts.append({
+                points.append({
                     "name": tag.upper(),
                     "lat": float(self.pred[tag]["lat"]),
                     "lon": float(self.pred[tag]["lon"]),
-                    "description": f"time={self.pred[tag]['t_utc']}"
+                    "description": f"time={self.pred[tag]['t_utc']} | source={self.pred[tag]['point_source']}"
                 })
 
-            kml_path = os.path.join(folder, f"reentry_corridor_pred_{norad}_{stamp}.kml")
-            export_kml_tracks_and_points(kml_path, tracks, pts, swath_polygon=swath_poly)
+            kml_path = os.path.join(folder, f"reentry_refined_{norad}_{stamp}.kml")
+            export_kml(kml_path, tracks, points, swath_poly=swath_poly)
 
             self._log(f"Saved KML: {kml_path}")
             messagebox.showinfo("KML Exported", "KML exported successfully.")
@@ -1049,47 +1023,34 @@ class ReentryGUI(tk.Tk):
             norad = int(self.var_norad.get().strip())
             stamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-            # Save raw TIP
             if self.tip_raw is not None:
                 tip_path = os.path.join(folder, f"tip_raw_{norad}_{stamp}.json")
                 with open(tip_path, "w", encoding="utf-8") as f:
                     json.dump(self.tip_raw, f, indent=2)
                 self._log(f"Saved: {tip_path}")
 
-            # Save latest batch
-            if self.solutions_latest:
+            if self.sol_latest:
                 latest_path = os.path.join(folder, f"tip_latest_batch_{norad}_{stamp}.json")
                 with open(latest_path, "w", encoding="utf-8") as f:
-                    json.dump([s.raw for s in self.solutions_latest], f, indent=2)
+                    json.dump([s.raw for s in self.sol_latest], f, indent=2)
                 self._log(f"Saved: {latest_path}")
 
-            # Save TLE used
-            if self.tle is not None:
-                name, l1, l2 = self.tle
+            if self.tle_latest is not None:
+                name, l1, l2 = self.tle_latest
                 tle_path = os.path.join(folder, f"tle_{norad}_{stamp}.txt")
                 with open(tle_path, "w", encoding="utf-8") as f:
                     f.write(name + "\n" + l1 + "\n" + l2 + "\n")
                 self._log(f"Saved: {tle_path}")
 
-            # Save prediction JSON
             if self.pred:
                 pred_path = os.path.join(folder, f"prediction_{norad}_{stamp}.json")
                 with open(pred_path, "w", encoding="utf-8") as f:
                     json.dump(self.pred, f, indent=2)
                 self._log(f"Saved: {pred_path}")
 
-            # Save plot PNG
             png_path = os.path.join(folder, f"map_{norad}_{stamp}.png")
             self.fig.savefig(png_path, dpi=220)
             self._log(f"Saved: {png_path}")
-
-            # Copy history CSV
-            hist = history_path(self.out_dir, norad)
-            if os.path.exists(hist):
-                hist_copy = os.path.join(folder, f"tip_history_{norad}.csv")
-                with open(hist, "r", encoding="utf-8") as src, open(hist_copy, "w", encoding="utf-8") as dst:
-                    dst.write(src.read())
-                self._log(f"Saved: {hist_copy}")
 
             messagebox.showinfo("Saved", "Outputs saved successfully.")
 
@@ -1101,7 +1062,6 @@ class ReentryGUI(tk.Tk):
 def main():
     app = ReentryGUI()
     app.mainloop()
-
 
 if __name__ == "__main__":
     main()
