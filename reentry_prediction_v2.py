@@ -2,6 +2,7 @@
 """
 Reentry Monitor GUI (TIP + TLE) — LATEST TIP ONLY + Map Envelope
 WITH: pymsis density + NOAA Kp fetch + Monte Carlo prediction + KML export (corridor + swath + points)
++ ✅ Proxy Report Generator (PNG + optional PDF)
 
 FIX INCLUDED:
 - If latest TIP batch yields start == end (0s window), auto-expand the window using:
@@ -40,6 +41,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import Rectangle  # ✅ for report
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -186,23 +188,19 @@ def parse_uncertainty_seconds(val: Any) -> Optional[float]:
     s = s.replace("~", "").replace("≈", "").replace("about", "").replace("+/-", "±").replace("±", "")
     s = s.strip()
 
-    # patterns like "0h 48m", "48m", "12 min", "2880s"
     total = 0.0
     found = False
 
-    # hours
     m = re.search(r"(\d+(?:\.\d+)?)\s*h", s)
     if m:
         total += float(m.group(1)) * 3600.0
         found = True
 
-    # minutes
     m = re.search(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes)\b", s)
     if m:
         total += float(m.group(1)) * 60.0
         found = True
 
-    # seconds
     m = re.search(r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds)\b", s)
     if m:
         total += float(m.group(1))
@@ -211,7 +209,6 @@ def parse_uncertainty_seconds(val: Any) -> Optional[float]:
     if found and total > 0:
         return total
 
-    # fallback: just a number in text
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     if m:
         x = float(m.group(1))
@@ -225,9 +222,6 @@ def parse_uncertainty_seconds(val: Any) -> Optional[float]:
 
 
 def tip_batch_uncertainty_seconds(latest_batch: List[TipSolution]) -> Optional[float]:
-    """
-    Scan common candidate fields in TIP rows. TIP schemas vary, so this is best-effort.
-    """
     candidate_keys = [
         "EPOCH_UNCERTAINTY",
         "EPOCH_UNC",
@@ -421,10 +415,6 @@ def compute_tip_window_from_latest_batch(
     solutions_latest_batch: List[TipSolution],
     fallback_uncert_minutes: float
 ) -> Tuple[Optional[dt.datetime], Optional[dt.datetime], List[dt.datetime], str]:
-    """
-    Returns (window_start, window_end, decay_epochs, window_mode)
-    window_mode describes whether it came from TIP spread, TIP uncertainty, or GUI fallback.
-    """
     decays: List[dt.datetime] = []
     for s in solutions_latest_batch:
         if s.decay_epoch:
@@ -439,17 +429,14 @@ def compute_tip_window_from_latest_batch(
     wmin = min(decays)
     wmax = max(decays)
 
-    # If non-zero spread, good.
     if (wmax - wmin).total_seconds() > 0:
         return wmin, wmax, decays, "tip_spread"
 
-    # Zero-width => expand using TIP uncertainty if available
     tip_unc_sec = tip_batch_uncertainty_seconds(solutions_latest_batch)
     if tip_unc_sec and tip_unc_sec > 0:
         half = dt.timedelta(seconds=float(tip_unc_sec))
         return wmin - half, wmax + half, decays, "tip_uncertainty"
 
-    # Else GUI fallback
     half = dt.timedelta(minutes=float(fallback_uncert_minutes))
     return wmin - half, wmax + half, decays, "fallback_uncertainty"
 
@@ -572,26 +559,99 @@ def pymsis_density_kg_m3(
     if pymsis_msis is None:
         raise RuntimeError("pymsis not installed. pip install pymsis")
 
-    t64 = np.array([np.datetime64(time_utc.replace(tzinfo=dt.timezone.utc))])
-    alt = np.array([float(alt_km)], dtype=float)
-    lat = np.array([float(lat_deg)], dtype=float)
-    lon = np.array([float(lon_deg)], dtype=float)
-    f107_arr = np.array([float(f107)], dtype=float)
-    f107a_arr = np.array([float(f107a)], dtype=float)
-    ap_vec = np.array([[float(ap_scalar)] * 7], dtype=float)
+    t64 = np.array([np.datetime64(time_utc.astimezone(dt.timezone.utc).replace(tzinfo=None))])
 
-    out = pymsis_msis.run(t64, alt, lat, lon, f107=f107_arr, f107a=f107a_arr, ap=ap_vec)
+    lons = np.array([float(lon_deg)], dtype=float)
+    lats = np.array([float(lat_deg)], dtype=float)
+    alts = np.array([float(alt_km)], dtype=float)
 
-    rho = None
-    if hasattr(out, "rho"):
-        rho = np.asarray(out.rho).squeeze()
-    elif isinstance(out, dict) and "rho" in out:
-        rho = np.asarray(out["rho"]).squeeze()
+    f107s = np.array([float(f107)], dtype=float)
+    f107as = np.array([float(f107a)], dtype=float)
 
-    if rho is None:
-        raise RuntimeError("pymsis output did not contain mass density 'rho'")
+    aps = np.array([[float(ap_scalar)] * 7], dtype=float)
 
+    out = pymsis_msis.run(
+        t64, lons, lats, alts,
+        f107s=f107s,
+        f107as=f107as,
+        aps=aps,
+        version=0,                 # <-- KEY FIX (MSISE-00)
+        geomagnetic_activity=1,     # daily Ap mode
+    )
+
+    arr = np.asarray(out)
+    if arr.ndim == 2:
+        rho = arr[0, 0]
+    else:
+        rho = arr[0, 0, 0, 0, 0]
     return float(rho)
+
+
+# -----------------------------
+# ✅ Proxy report generator (PNG + optional PDF)
+# -----------------------------
+def generate_proxy_report(
+    out_path_png: str,
+    *,
+    norad_id: int,
+    object_name: str,
+    created_utc: str,
+    reentry_epoch_utc: str,
+    epoch_uncertainty_text: str,
+    window_start_utc: str,
+    window_end_utc: str,
+    p50_latlon_text: str,
+    kp_text: str,
+    footer_text: str = "This report is an operational proxy. For close agreement, load EU-SST PDF to anchor epoch/time.",
+    out_path_pdf: Optional[str] = None,
+) -> None:
+    fig = plt.figure(figsize=(8.6, 9.2), dpi=160)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+
+    ax.text(0.5, 0.94, "Re-entry Analysis Report (Proxy)", ha="center", va="center",
+            fontsize=20, fontweight="bold")
+    ax.text(0.5, 0.905, f"NORAD {norad_id}  |  {object_name}", ha="center", va="center",
+            fontsize=12)
+
+    left, right = 0.10, 0.90
+    top, bottom = 0.82, 0.27
+    width, height = (right - left), (top - bottom)
+
+    rows = [
+        ("Creation Date (UTC)", created_utc),
+        ("Re-entry Epoch (UTC)", reentry_epoch_utc),
+        ("Epoch Uncertainty", epoch_uncertainty_text),
+        ("Window Start (UTC)", window_start_utc),
+        ("Window End (UTC)", window_end_utc),
+        ("Predicted P50 Lat/Lon", p50_latlon_text),
+        ("NOAA Kp daily mean", kp_text),
+    ]
+    n = len(rows)
+    row_h = height / n
+
+    ax.add_patch(Rectangle((left, bottom), width, height, fill=False, linewidth=1.5))
+
+    sep_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"]
+    for i in range(1, n):
+        y = top - i * row_h
+        ax.plot([left, right], [y, y], linewidth=1.0, color=sep_colors[(i - 1) % len(sep_colors)])
+
+    split = left + 0.46 * width
+
+    for i, (label, value) in enumerate(rows):
+        y_center = top - (i + 0.5) * row_h
+        ax.text(left + 0.02 * width, y_center, label, ha="left", va="center",
+                fontsize=13, fontweight="bold")
+        ax.text(split + 0.02 * width, y_center, str(value), ha="left", va="center",
+                fontsize=13)
+
+    ax.text(0.5, 0.09, footer_text, ha="center", va="center", fontsize=10)
+
+    fig.savefig(out_path_png, bbox_inches="tight", dpi=200)
+    if out_path_pdf:
+        fig.savefig(out_path_pdf, bbox_inches="tight")
+    plt.close(fig)
 
 
 # -----------------------------
@@ -827,12 +887,11 @@ class ReentryGUI(tk.Tk):
         self.var_f107 = tk.StringVar(value="150")
         self.var_f107a = tk.StringVar(value="150")
 
-        # ✅ NEW: fallback uncertainty minutes (used when TIP window is zero-width)
         self.var_fallback_uncert_min = tk.StringVar(value="48")
 
         self._build_ui()
         self._build_plot()
-        self._log("Ready. Fetch → Plot → Run Prediction → Export KML / Save outputs.")
+        self._log("Ready. Fetch → Plot → Run Prediction → Export KML / Save outputs → Generate Report.")
 
     def _build_ui(self):
         top = ttk.Frame(self, padding=10)
@@ -866,10 +925,7 @@ class ReentryGUI(tk.Tk):
 
         add_field("MC samples", self.var_mc_samples, 8)
         add_field("Swath ±km (KML)", self.var_swath_km, 8)
-
         ttk.Checkbutton(row2, text="Use sequential TLE B* bias", variable=self.var_use_bstar_bias).pack(side=tk.LEFT, padx=(6, 14))
-
-        # ✅ NEW fallback uncertainty
         add_field("Fallback uncertainty (min)", self.var_fallback_uncert_min, 6)
 
         row3 = ttk.Frame(self, padding=(10, 0, 10, 10))
@@ -886,6 +942,7 @@ class ReentryGUI(tk.Tk):
         ttk.Button(btns, text="Fetch TIP + TLE (latest TIP only)", command=self.on_fetch).pack(side=tk.LEFT)
         ttk.Button(btns, text="Plot Envelope (latest TIP min–max)", command=self.on_plot_envelope).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Run Kp+MSIS Prediction", command=self.on_run_prediction).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Generate Report (PNG/PDF)", command=self.on_generate_report).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Export KML (corridor + swath + points)", command=self.on_export_kml).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Save Outputs…", command=self.on_save_outputs).pack(side=tk.LEFT, padx=8)
 
@@ -982,7 +1039,7 @@ class ReentryGUI(tk.Tk):
                     )
 
             fallback_min = float(self._get_float(self.var_fallback_uncert_min, "Fallback uncertainty (min)"))
-            wmin, wmax, decays, mode = compute_tip_window_from_latest_batch(self.solutions_latest, fallback_min)
+            wmin, wmax, _, mode = compute_tip_window_from_latest_batch(self.solutions_latest, fallback_min)
             self.window_min, self.window_max = wmin, wmax
             self.window_mode = mode
 
@@ -996,7 +1053,6 @@ class ReentryGUI(tk.Tk):
                 self._log(f"Latest TIP MSG_EPOCH: {latest_msg_epoch} (batch rows: {len(self.solutions_latest)})")
                 self._log("But no valid DECAY_EPOCH values found in the latest batch.")
 
-            # Save history row
             if wmin and wmax:
                 hist_csv = history_path(self.out_dir, norad)
                 row = {
@@ -1132,13 +1188,89 @@ class ReentryGUI(tk.Tk):
             messagebox.showerror("Prediction error", str(e))
             self._log(f"ERROR: {e}")
 
-    # --- keep your existing export/save buttons as-is, omitted for brevity ---
-    # If you want: I can paste them again, unchanged.
+    # ✅ NEW: generate report using self.pred
+    def on_generate_report(self):
+        try:
+            if not self.pred:
+                raise RuntimeError("Run 'Run Kp+MSIS Prediction' first.")
+
+            norad = int(self.var_norad.get().strip())
+            obj_name = self.sat.name if self.sat else f"NORAD {norad}"
+
+            created_utc = self.pred.get("created_utc", dt_to_iso_z(dt.datetime.now(dt.timezone.utc)))
+
+            mc = self.pred.get("monte_carlo", {})
+            reentry_epoch_utc = mc.get("p50_utc", "N/A")
+
+            # Epoch uncertainty: ~(P10-P90)/2
+            epoch_uncertainty_text = "N/A"
+            p10s = mc.get("p10_utc")
+            p90s = mc.get("p90_utc")
+            if p10s and p90s:
+                try:
+                    p10 = parse_any_datetime_utc(p10s)
+                    p90 = parse_any_datetime_utc(p90s)
+                    half = (p90 - p10) / 2
+                    mins = int(round(half.total_seconds() / 60))
+                    h = mins // 60
+                    m = mins % 60
+                    epoch_uncertainty_text = f"~±{h}h {m:02d}m (P10–P90/2)"
+                except Exception:
+                    pass
+
+            tip_window = self.pred.get("tip_window", {})
+            window_start_utc = tip_window.get("start_utc", "N/A")
+            window_end_utc = tip_window.get("end_utc", "N/A")
+
+            imp50 = self.pred.get("impact_proxy", {}).get("p50", {})
+            if "lat" in imp50 and "lon" in imp50:
+                p50_latlon_text = f"{float(imp50['lat']):.4f}°, {float(imp50['lon']):.4f}°"
+            else:
+                p50_latlon_text = "N/A"
+
+            kp_val = self.pred.get("noaa_kp_mean_1m_near_mid", None)
+            kp_text = "N/A" if kp_val is None else f"{float(kp_val):.2f}"
+
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            png_path = os.path.join(self.out_dir, f"report_{norad}_{ts}.png")
+            pdf_path = os.path.join(self.out_dir, f"report_{norad}_{ts}.pdf")
+
+            generate_proxy_report(
+                png_path,
+                out_path_pdf=pdf_path,
+                norad_id=norad,
+                object_name=obj_name,
+                created_utc=created_utc,
+                reentry_epoch_utc=reentry_epoch_utc,
+                epoch_uncertainty_text=epoch_uncertainty_text,
+                window_start_utc=window_start_utc,
+                window_end_utc=window_end_utc,
+                p50_latlon_text=p50_latlon_text,
+                kp_text=kp_text,
+            )
+
+            self._log(f"Report saved: {png_path}")
+            self._log(f"Report saved: {pdf_path}")
+            messagebox.showinfo("Report created", f"Saved:\n{png_path}\n{pdf_path}")
+
+        except Exception as e:
+            messagebox.showerror("Report error", str(e))
+            self._log(f"ERROR: {e}")
+
+    # keep your existing export/save buttons as-is
     def on_export_kml(self):
-        messagebox.showinfo("Info", "Export KML part omitted here to keep the fix-focused version short.\nIf you want, I’ll paste the full KML functions unchanged.")
+        messagebox.showinfo(
+            "Info",
+            "Export KML part omitted here to keep the fix-focused version short.\n"
+            "If you want, I’ll paste the full KML functions unchanged."
+        )
 
     def on_save_outputs(self):
-        messagebox.showinfo("Info", "Save Outputs part omitted here to keep the fix-focused version short.\nIf you want, I’ll paste the full Save functions unchanged.")
+        messagebox.showinfo(
+            "Info",
+            "Save Outputs part omitted here to keep the fix-focused version short.\n"
+            "If you want, I’ll paste the full Save functions unchanged."
+        )
 
 
 def main():
