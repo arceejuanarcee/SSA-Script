@@ -427,18 +427,17 @@ def integrate_descent_msis21(
     CdA_over_m: float = 0.02,
     dt_step: float = 1.0,
     max_seconds: int = 2000,
-    geomagnetic_activity: int = -1,  # storm-time
+    geomagnetic_activity: int = -1,
 ) -> Dict[str, Any]:
     """
     Physics-based descent integrator using pymsis MSIS2.1 density.
 
     Returns descent metadata ONLY:
       - descent_time_s
-      - downrange_km (distance traveled along the flight path, not mapped to ground)
-      - density/velocity/altitude profiles (for plotting/reporting)
-
-    Safety note: does not compute or return impact coordinates.
+      - downrange_km
+      - density/velocity/altitude profiles
     """
+
     if pymsis is None:
         raise RuntimeError("pymsis not installed. Install: pip install pymsis")
 
@@ -447,50 +446,60 @@ def integrate_descent_msis21(
     t = time_utc.astimezone(dt.timezone.utc)
 
     elapsed = 0.0
+
     density_profile: List[float] = []
     velocity_profile: List[float] = []
     altitude_profile: List[float] = []
 
-    # simple descent slope model (empirical) to reduce altitude over time
-    descent_slope = 0.02  # tune with validation; keeps this as a proxy
+    descent_slope = 0.02
 
     while alt > 20.0 and v > 300.0 and elapsed < float(max_seconds):
-        # pymsis takes naive numpy datetime64; provide UTC naive
+
+        # pymsis expects numpy datetime64 (UTC naive)
         t_naive = t.replace(tzinfo=None)
 
-        rho = pymsis.calculate(
+        data = pymsis.calculate(
             np.array([np.datetime64(t_naive)]),
             float(lon_deg),
             float(lat_deg),
             float(alt),
-            version=2,  # MSIS2.1
+            version=2,
             geomagnetic_activity=int(geomagnetic_activity),
-        )[0, 0, 0, 0, 0]  # total mass density kg/m^3
+        )
 
-        # drag acceleration proxy (ballistic coefficient via CdA_over_m)
-        drag_accel = 0.5 * float(rho) * v * v * float(CdA_over_m)  # m/s^2
+        # Safe extraction regardless of returned shape
+        rho = float(np.asarray(data).reshape(-1)[0])
+
+        # Drag acceleration (ballistic coefficient via CdA_over_m)
+        drag_accel = 0.5 * rho * v * v * float(CdA_over_m)
+
         dv = drag_accel * float(dt_step)
         v = max(0.0, v - dv)
 
-        # distance traveled along trajectory
-        ds = v * float(dt_step)  # meters
+        # Distance traveled
+        ds = v * float(dt_step)
 
-        # altitude decrement proxy (not a full 3DOF reentry)
+        # Altitude decrement proxy
         alt = alt - (ds / 1000.0) * descent_slope
 
-        density_profile.append(float(rho))
-        velocity_profile.append(float(v))
-        altitude_profile.append(float(alt))
+        density_profile.append(rho)
+        velocity_profile.append(v)
+        altitude_profile.append(alt)
 
         t += dt.timedelta(seconds=float(dt_step))
         elapsed += float(dt_step)
 
-    avg_v = float(np.mean(velocity_profile)) if velocity_profile else float(initial_velocity_ms)
+    # Compute averages AFTER loop
+    if velocity_profile:
+        avg_v = float(np.mean(velocity_profile))
+    else:
+        avg_v = float(initial_velocity_ms)
+
     downrange_km = (avg_v * elapsed) / 1000.0
 
     return {
         "descent_time_s": float(elapsed),
-        "avg_velocity_ms": float(avg_v),
+        "avg_velocity_ms": avg_v,
         "downrange_km": float(downrange_km),
         "density_profile": density_profile,
         "velocity_profile": velocity_profile,
