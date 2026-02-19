@@ -1,0 +1,7 @@
+numpy
+requests
+dotenv
+matplotlib
+cartopy
+skyfield
+pymsis
