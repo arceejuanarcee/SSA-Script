@@ -681,10 +681,15 @@ def mc_sample_times_with_bias(
     if kp_mean is not None and np.isfinite(kp_mean):
         bias += -0.08 * np.tanh((kp_mean - 2.0) / 2.0)
 
-    bias = float(np.clip(bias, -0.30, +0.20))
+    # Calibrated uncertainty: keep bias small, use low k so P10-P90
+    # spans ~60% of the TIP window rather than squeezing to ~30%.
+    # This keeps our uncertainty comparable to EU SST / Space-Track
+    # rather than misleadingly narrow.
+    bias = float(np.clip(bias, -0.20, +0.15))
 
-    mean = float(np.clip(0.5 + bias, 0.08, 0.92))
-    k = 10.0
+    mean = float(np.clip(0.5 + bias, 0.15, 0.85))
+    # k=4 → Beta(2,2)-like spread; std ≈ 0.17*window vs k=10 which was ~0.09*window
+    k = 4.0
     a = mean * k
     b = (1.0 - mean) * k
 
@@ -926,6 +931,7 @@ class ReentryGUI(tk.Tk):
 
         self.sat: Optional[EarthSatellite] = None
         self.pred: Dict[str, Any] = {}
+        self.selected_tip_msg_epoch: Optional[str] = None  # None → use latest
 
         self.var_user = tk.StringVar(value=os.getenv("SPACE_TRACK_USERNAME", ""))
         self.var_pass = tk.StringVar(value=os.getenv("SPACE_TRACK_PASSWORD", ""))
@@ -1004,6 +1010,19 @@ class ReentryGUI(tk.Tk):
         ttk.Button(btns, text="Generate Report (PNG/PDF)", command=self.on_generate_report).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Export KML (corridor + swath + points)", command=self.on_export_kml).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Save Outputs…", command=self.on_save_outputs).pack(side=tk.LEFT, padx=8)
+
+        # ── TIP message selector ──────────────────────────────────────
+        tip_sel_row = ttk.Frame(self, padding=(10, 0, 10, 6))
+        tip_sel_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(tip_sel_row, text="Predict using TIP MSG_EPOCH:").pack(side=tk.LEFT)
+        self.var_tip_selector = tk.StringVar(value="(latest)")
+        self.tip_selector_cb = ttk.Combobox(
+            tip_sel_row, textvariable=self.var_tip_selector,
+            width=36, state="readonly"
+        )
+        self.tip_selector_cb.pack(side=tk.LEFT, padx=(6, 12))
+        self.tip_selector_cb.bind("<<ComboboxSelected>>", self._on_tip_selector_changed)
+        ttk.Label(tip_sel_row, text="← select a past TIP message to recompute its window").pack(side=tk.LEFT)
 
         self.status = tk.Text(self, height=10)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1129,6 +1148,9 @@ class ReentryGUI(tk.Tk):
 
             self.pred = {}
 
+            # ── Populate TIP selector combobox ───────────────────────
+            self._refresh_tip_selector()
+
         except Exception as e:
             messagebox.showerror("Fetch error", str(e))
             self._log(f"ERROR: {e}")
@@ -1192,6 +1214,8 @@ class ReentryGUI(tk.Tk):
                 raise RuntimeError("Still zero-width window. Increase 'Fallback uncertainty (min)' and Fetch again.")
 
             mc_n = max(200, min(50000, self._get_int(self.var_mc_samples, "MC samples")))
+            before_min = self._get_int(self.var_before, "Window Before (min)")
+            after_min  = self._get_int(self.var_after,  "After (min)")
 
             wmid = wmin + dt.timedelta(seconds=width_s / 2)
             kp_mean = fetch_noaa_kp_1m_mean_near(wmid, hours_window=12)
@@ -1242,6 +1266,30 @@ class ReentryGUI(tk.Tk):
             self._log(f"NOAA Kp mean near mid: {kp_mean if kp_mean is not None else 'N/A'} | Ap proxy: {ap:.1f}")
             self._log(f"P50 time: {dt_to_iso_z(p50)} | {dt_to_iso_ph(p50)}")
             self._log(f"P50 impact proxy: lat={lat50:.3f}, lon={lon50:.3f} | downrange={meta50['downrange_km']:.0f} km | tdesc={meta50['descent_time_s']:.0f}s")
+
+            # ── Uncertainty display ───────────────────────────────────
+            uncert_half_s = (p90 - p10).total_seconds() / 2.0
+            uncert_half_min = uncert_half_s / 60.0
+            uncert_half_hr  = uncert_half_s / 3600.0
+            tip_window_hr = width_s / 3600.0
+            self._log(
+                f"--- UNCERTAINTY SUMMARY ---\n"
+                f"  TIP window (input)  : ±{tip_window_hr/2:.2f} h  ({width_s/60:.0f} min total)\n"
+                f"  MC P10              : {dt_to_iso_z(p10)} | {dt_to_iso_ph(p10)}\n"
+                f"  MC P50 (best est.)  : {dt_to_iso_z(p50)} | {dt_to_iso_ph(p50)}\n"
+                f"  MC P90              : {dt_to_iso_z(p90)} | {dt_to_iso_ph(p90)}\n"
+                f"  80% interval width  : {(p90-p10).total_seconds()/60:.1f} min\n"
+                f"  ± half-width (80%)  : ±{uncert_half_min:.1f} min  (±{uncert_half_hr:.2f} h)"
+            )
+            self.pred['uncertainty'] = {
+                'p10_utc': dt_to_iso_z(p10),
+                'p50_utc': dt_to_iso_z(p50),
+                'p90_utc': dt_to_iso_z(p90),
+                'interval_80pct_min': round((p90 - p10).total_seconds() / 60.0, 1),
+                'half_width_min': round(uncert_half_min, 1),
+                'half_width_hr':  round(uncert_half_hr,  3),
+                'tip_window_total_min': round(width_s / 60.0, 1),
+            }
 
             # ── Philippines crossing detection ────────────────────────
             # Scan the full prediction window at fine resolution for passes
@@ -1304,6 +1352,62 @@ class ReentryGUI(tk.Tk):
                     })
             else:
                 self._log("No Philippines crossing detected within the prediction window.")
+
+            # ── Philippines overpass probability (rough estimate) ────
+            # Method: for each 15-s groundtrack point in the full scan window
+            # count total steps vs steps inside PH bbox. Then ratio = rough
+            # probability that the reentry occurs while over the Philippines.
+            # Also compute: for each remaining full orbit, what fraction of
+            # its duration is spent over PH → P(PH | one orbit).
+            try:
+                PH_LAT_MIN2, PH_LAT_MAX2 = 4.0, 22.0
+                PH_LON_MIN2, PH_LON_MAX2 = 115.0, 130.0
+                orbital_period_min = 2 * math.pi / (self.sat.model.no_kozai) * (1/60.0)  # minutes
+                # Remaining passes from now until wmax
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                scan_start = max(now_utc, wmin)
+                scan_end   = wmax
+                total_scan_s = max(1.0, (scan_end - scan_start).total_seconds())
+                n_orbits_remaining = total_scan_s / (orbital_period_min * 60.0)
+
+                # Sample at 15-s across the full remaining window using wmid track
+                scan_lats, scan_lons, _ = groundtrack_corridor(
+                    self.sat, scan_start + dt.timedelta(seconds=total_scan_s/2),
+                    int(total_scan_s/120), int(total_scan_s/120), 15
+                )
+                total_pts = len(scan_lats)
+                ph_pts = sum(
+                    1 for la, lo in zip(scan_lats, scan_lons)
+                    if PH_LAT_MIN2 <= la <= PH_LAT_MAX2 and PH_LON_MIN2 <= lo <= PH_LON_MAX2
+                )
+                ph_fraction = ph_pts / max(1, total_pts)
+
+                # Time over PH per orbit (seconds)
+                ph_time_per_orbit_s = ph_fraction * orbital_period_min * 60.0
+                # Total time in remaining window that is over PH
+                ph_total_time_s = ph_fraction * total_scan_s
+
+                self._log(
+                    f"--- PHILIPPINES OVERPASS PROBABILITY ---\n"
+                    f"  Orbital period      : {orbital_period_min:.1f} min\n"
+                    f"  Remaining scan window: {total_scan_s/60:.1f} min ({n_orbits_remaining:.1f} orbits)\n"
+                    f"  PH bbox pts / total : {ph_pts} / {total_pts} = {ph_fraction*100:.2f}%\n"
+                    f"  Time over PH / orbit: ~{ph_time_per_orbit_s:.0f} s ({ph_time_per_orbit_s/60:.1f} min)\n"
+                    f"  Rough P(reentry over PH): {ph_fraction*100:.2f}%  "
+                    f"(= {ph_total_time_s:.0f}s over PH / {total_scan_s:.0f}s window)"
+                )
+                self.pred['ph_overpass_probability'] = {
+                    'orbital_period_min': round(orbital_period_min, 2),
+                    'remaining_window_min': round(total_scan_s / 60.0, 1),
+                    'n_orbits_remaining': round(n_orbits_remaining, 2),
+                    'ph_pts': ph_pts,
+                    'total_pts': total_pts,
+                    'ph_fraction_pct': round(ph_fraction * 100, 3),
+                    'ph_time_per_orbit_s': round(ph_time_per_orbit_s, 1),
+                    'ph_total_time_in_window_s': round(ph_total_time_s, 1),
+                }
+            except Exception as ph_err:
+                self._log(f"PH probability calc skipped: {ph_err}")
 
         except Exception as e:
             messagebox.showerror("Prediction error", str(e))
@@ -1377,6 +1481,67 @@ class ReentryGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Report error", str(e))
             self._log(f"ERROR: {e}")
+
+    # ── TIP selector helpers ───────────────────────────────────────────────
+    def _refresh_tip_selector(self):
+        """Populate the TIP message combobox with all fetched MSG_EPOCHs."""
+        if not hasattr(self, 'tip_selector_cb'):
+            return
+        epochs = []
+        seen = set()
+        for s in self.solutions_all:
+            ep = s.msg_epoch
+            if ep and ep not in seen:
+                seen.add(ep)
+                # find decay + window for display
+                batch = [x for x in self.solutions_all if x.msg_epoch == ep]
+                decays = []
+                for b in batch:
+                    try:
+                        decays.append(parse_any_datetime_utc(b.decay_epoch))
+                    except Exception:
+                        pass
+                if decays:
+                    w_field = batch[0].raw.get('WINDOW', '?')
+                    decay_str = dt_to_iso_z(min(decays) + (max(decays)-min(decays))/2)
+                    epochs.append(f"{ep}  →  decay~{decay_str}  W={w_field}min")
+                else:
+                    epochs.append(ep)
+        values = ["(latest)"] + epochs
+        self.tip_selector_cb['values'] = values
+        self.var_tip_selector.set("(latest)")
+        self.selected_tip_msg_epoch = None
+        self._log(f"TIP selector populated: {len(epochs)} message epochs available.")
+
+    def _on_tip_selector_changed(self, event=None):
+        """When user picks a TIP epoch, recompute the decay window from that batch."""
+        val = self.var_tip_selector.get().strip()
+        if val == "(latest)" or not val:
+            self.selected_tip_msg_epoch = None
+            # restore latest batch window
+            fallback = float(self.var_fallback_uncert_min.get().strip())
+            wmin, wmax, _, mode = compute_tip_window_from_latest_batch(
+                self.solutions_latest, fallback
+            )
+            self.window_min, self.window_max, self.window_mode = wmin, wmax, mode
+            self._log(f"Window restored to latest TIP: {dt_to_iso_z(wmin)} – {dt_to_iso_z(wmax)}")
+        else:
+            # Extract just the MSG_EPOCH part (before the first two spaces)
+            ep = val.split('  ')[0].strip()
+            self.selected_tip_msg_epoch = ep
+            batch = [s for s in self.solutions_all if s.msg_epoch == ep]
+            if not batch:
+                self._log(f"No TIP data found for epoch {ep}")
+                return
+            fallback = float(self.var_fallback_uncert_min.get().strip())
+            wmin, wmax, _, mode = compute_tip_window_from_latest_batch(batch, fallback)
+            self.window_min, self.window_max, self.window_mode = wmin, wmax, mode
+            self._log(
+                f"Window set from TIP {ep}: "
+                f"{dt_to_iso_z(wmin)} – {dt_to_iso_z(wmax)}  "
+                f"(width {fmt_timedelta(wmax-wmin)}, mode={mode})"
+            )
+        self.pred = {}
 
     # ── KML export (corridor + swath + impact points) ──────────────────────
     def on_export_kml(self):
